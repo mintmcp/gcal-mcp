@@ -1329,12 +1329,17 @@ export class GoogleCalendarTools {
             const availableSlots: Array<{ start: FormattedDateTime; end: FormattedDateTime }> = [];
             let currentTime = new Date(searchStart);
 
-            // Helper function to check if a time is within search hours
-            const isWithinSearchHours = (date: Date, tz: string): boolean => {
-              // If no search hours specified, all times are valid
-              if (!searchHoursStart && !searchHoursEnd) return true;
-              
-              // Convert to timezone-specific time
+            // Helper function to check if a time is within search hours.
+            // `boundary` indicates whether `date` is a slot-start (strict upper bound)
+            // or a slot-end (inclusive upper bound — a meeting ending exactly at
+            // `searchHoursEnd` is allowed).
+            const isWithinSearchHours = (
+              date: Date,
+              tz: string,
+              boundary: 'start' | 'end',
+            ): boolean => {
+              // Always resolve the wall-clock weekday/time in the target zone so the
+              // includeDays filter is applied even when no hour window is set.
               const formatter = new Intl.DateTimeFormat('en-US', {
                 timeZone: tz,
                 hour: '2-digit',
@@ -1343,23 +1348,21 @@ export class GoogleCalendarTools {
                 hour12: false,
                 weekday: 'short'
               });
-              
+
               const parts = formatter.formatToParts(date);
               const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
               const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
               const second = parseInt(parts.find(p => p.type === 'second')?.value || '0');
               const weekday = parts.find(p => p.type === 'weekday')?.value;
-              
+
               // Check if this day is included
-              if (includeDays && !includeDays.includes(weekday)) return false;
-              
-              // Convert current time to seconds since midnight
+              if (includeDays && weekday && !includeDays.includes(weekday)) return false;
+
+              // If no hour window is set, weekday gating is the only constraint.
+              if (!searchHoursStart && !searchHoursEnd) return true;
+
               const currentTimeInSeconds = hour * 3600 + minute * 60 + second;
-              
-              // Parse search hours
-              let startSeconds = 0;
-              let endSeconds = 24 * 3600; // Default to end of day
-              
+
               const parseHms = (s: string): number => {
                 const [h = 0, m = 0, sec = 0] = s.split(':').map((v) => {
                   const n = Number(v);
@@ -1367,11 +1370,18 @@ export class GoogleCalendarTools {
                 });
                 return h * 3600 + m * 60 + sec;
               };
+
+              let startSeconds = 0;
+              let endSeconds = 24 * 3600; // Default to end of day
               if (searchHoursStart) startSeconds = parseHms(searchHoursStart);
               if (searchHoursEnd) endSeconds = parseHms(searchHoursEnd);
-              
-              // Check if within search hours
-              return currentTimeInSeconds >= startSeconds && currentTimeInSeconds < endSeconds;
+
+              // Slot-start must be strictly before the window end; slot-end may
+              // equal the window end (a 16:00-17:00 meeting fits a "until 17:00" window).
+              if (currentTimeInSeconds < startSeconds) return false;
+              return boundary === 'end'
+                ? currentTimeInSeconds <= endSeconds
+                : currentTimeInSeconds < endSeconds;
             };
 
             // Helper function to advance to next slot
@@ -1429,7 +1439,7 @@ export class GoogleCalendarTools {
               slotEnd.setMinutes(slotEnd.getMinutes() + duration);
 
               // Check if slot is within search hours
-              if (isWithinSearchHours(slotStart, timezone) && isWithinSearchHours(slotEnd, timezone)) {
+              if (isWithinSearchHours(slotStart, timezone, 'start') && isWithinSearchHours(slotEnd, timezone, 'end')) {
                 // Check if slot is available (not busy)
                 if (!isSlotBusy(slotStart, slotEnd)) {
                   const startISO = toLocalISO(slotStart, timezone);
