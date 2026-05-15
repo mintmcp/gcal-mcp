@@ -424,6 +424,32 @@ interface FreeBusyResponse {
   };
 }
 
+// Reusable INPUT schema fragments.
+// Attendees may be supplied either as a bare email string ("alice@example.com")
+// or as an object granting access to richer Calendar fields. `optional` marks
+// the attendee as non-essential (Google Calendar shows a "(Optional)" tag).
+const attendeeInputSchema = z.union([
+  z.string(),
+  z.object({
+    email: z.string(),
+    displayName: z.string().optional(),
+    optional: z.boolean().optional(),
+  }),
+]);
+
+function normalizeAttendees(
+  input: Array<string | { email: string; displayName?: string; optional?: boolean }> | undefined
+): Array<{ email: string; displayName?: string; optional?: boolean }> | undefined {
+  if (!input) return undefined;
+  return input.map((a) => {
+    if (typeof a === 'string') return { email: a };
+    const out: { email: string; displayName?: string; optional?: boolean } = { email: a.email };
+    if (typeof a.displayName === 'string' && a.displayName.length > 0) out.displayName = a.displayName;
+    if (a.optional === true) out.optional = true;
+    return out;
+  });
+}
+
 // Reusable output schema fragments.
 // All schemas use .passthrough() + inner-optional fields so undocumented
 // Google Calendar response fields don't trigger output validation errors.
@@ -825,7 +851,7 @@ export class GoogleCalendarTools {
             .optional()
             .default("UTC")
             .describe('IANA timezone (e.g. "America/Los_Angeles"). Used when `start`/`end` are naive datetimes or date-only. Default: UTC.'),
-          attendees: z.array(z.string()).optional().describe('Email addresses of attendees to invite.'),
+          attendees: z.array(attendeeInputSchema).optional().describe('Attendees to invite. Each item may be a bare email string ("alice@example.com") or an object {email, displayName?, optional?}. Set optional=true to mark an attendee as non-essential.'),
           sendUpdates: z
             .enum(['all', 'externalOnly', 'none'])
             .optional()
@@ -875,8 +901,9 @@ export class GoogleCalendarTools {
               };
             }
 
-            if (attendees && attendees.length > 0) {
-              event.attendees = attendees.map((email: string) => ({ email }));
+            const normalizedAttendees = normalizeAttendees(attendees);
+            if (normalizedAttendees && normalizedAttendees.length > 0) {
+              event.attendees = normalizedAttendees;
             }
 
             const encodedCalendarId = encodeURIComponent(calendarId);
@@ -977,9 +1004,9 @@ export class GoogleCalendarTools {
             .default("UTC")
             .describe('IANA timezone used to interpret naive `start`/`end` datetimes. Default: UTC.'),
           attendees: z
-            .array(z.string())
+            .array(attendeeInputSchema)
             .optional()
-            .describe('Replaces the attendee list with the given emails. Pass [] to remove all attendees.'),
+            .describe('REPLACES the entire attendee list with the given items (each a bare email or {email, displayName?, optional?}). Include existing attendees you want to keep. Pass [] to remove all.'),
           sendUpdates: z
             .enum(['all', 'externalOnly', 'none'])
             .optional()
@@ -1038,7 +1065,7 @@ export class GoogleCalendarTools {
             }
 
             if (attendees !== undefined) {
-              updates.attendees = attendees.map((email: string) => ({ email }));
+              updates.attendees = normalizeAttendees(attendees) || [];
             }
 
             const encodedCalendarId = encodeURIComponent(calendarId);
