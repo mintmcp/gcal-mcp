@@ -2,8 +2,12 @@ import { z } from "zod";
 import { withGoogleAuth as requirePermissionSecure } from "./auth.js";
 import MarkdownIt from 'markdown-it';
 
+// `html: false` is intentional: descriptions come from LLM-generated text that
+// may inadvertently contain raw HTML/script tags. Disabling pass-through still
+// lets us emit the limited HTML (links, lists, emphasis, code) that Google
+// Calendar's web UI actually renders.
 const md = new MarkdownIt({
-  html: true,
+  html: false,
   linkify: true,
   typographer: true,
   breaks: true
