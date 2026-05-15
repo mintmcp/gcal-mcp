@@ -480,9 +480,15 @@ const eventSchema = z.object({
 
 export class GoogleCalendarTools {
   private static getDayOfWeek(dateStr: string): string {
-    const date = new Date(dateStr);
+    // Use the wall-clock date portion (YYYY-MM-DD) rather than absolute time,
+    // so events report the day they appear on in the user's calendar regardless
+    // of server timezone. Anchor at UTC noon to dodge DST/edge issues.
+    const tIdx = dateStr.indexOf('T');
+    const datePart = tIdx >= 0 ? dateStr.slice(0, tIdx) : dateStr;
+    const date = new Date(`${datePart}T12:00:00Z`);
+    if (Number.isNaN(date.getTime())) return '';
     const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    return days[date.getDay()];
+    return days[date.getUTCDay()];
   }
 
   private static sanitizeConferenceData(cd?: CalendarEvent['conferenceData']): ConferenceData | undefined {
@@ -510,34 +516,38 @@ export class GoogleCalendarTools {
 
   private static formatDateTimeWithDay(eventDateTime: { dateTime?: string; date?: string }): FormattedDateTime {
     if (eventDateTime.dateTime) {
-      // Parse ISO datetime string
-      const dt = new Date(eventDateTime.dateTime);
-      const dateStr = dt.toISOString().split('T')[0]; // YYYY-MM-DD
-      
-      // Extract time and timezone from the original string
-      const timePart = eventDateTime.dateTime.split('T')[1];
+      // Preserve the wall-clock date/time from the original ISO string so that
+      // a zone-aware datetime like "2024-01-15T23:00:00-08:00" reports
+      // date="2024-01-15" + time="23:00:00", not the UTC-shifted date.
+      const raw = eventDateTime.dateTime;
+      const tIdx = raw.indexOf('T');
+      const datePart = tIdx >= 0 ? raw.slice(0, tIdx) : raw;
+      const timePart = tIdx >= 0 ? raw.slice(tIdx + 1) : '';
+
       let time = '';
       let timezone = '';
-      
       if (timePart) {
-        // Handle timezone offset (e.g., -08:00 or Z)
-        if (timePart.includes('+') || timePart.includes('-')) {
-          const parts = timePart.split(/[+-]/);
-          time = parts[0];
-          timezone = timePart.substring(parts[0].length);
-        } else if (timePart.includes('Z')) {
-          time = timePart.replace('Z', '');
+        if (timePart.endsWith('Z')) {
+          time = timePart.slice(0, -1);
           timezone = 'Z';
         } else {
-          time = timePart;
+          // Look for an offset suffix at position >= "HH:MM" length (5).
+          // This avoids confusing a '-' inside the date with an offset sign.
+          const offsetMatch = timePart.match(/([+-]\d{2}:\d{2})$/);
+          if (offsetMatch) {
+            timezone = offsetMatch[1];
+            time = timePart.slice(0, -timezone.length);
+          } else {
+            time = timePart;
+          }
         }
       }
-      
+
       return {
-        date: dateStr,
-        time: time,
-        dayOfWeek: this.getDayOfWeek(eventDateTime.dateTime),
-        timezone: timezone
+        date: datePart,
+        time,
+        dayOfWeek: this.getDayOfWeek(raw),
+        timezone,
       };
     } else if (eventDateTime.date) {
       // All-day event, only has date
@@ -546,7 +556,7 @@ export class GoogleCalendarTools {
         dayOfWeek: this.getDayOfWeek(eventDateTime.date)
       };
     }
-    
+
     // Fallback (shouldn't happen)
     return {
       date: '',
