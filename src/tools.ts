@@ -278,6 +278,70 @@ function okResult<T extends Record<string, unknown>>(structured: T) {
   };
 }
 
+// ISO 8601 patterns:
+//   - Date-only:        YYYY-MM-DD
+//   - Naive datetime:   YYYY-MM-DDTHH:MM[:SS][.fff]
+//   - Aware datetime:   YYYY-MM-DDTHH:MM[:SS][.fff](Z|±HH:MM)
+const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATETIME_AWARE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_DATETIME_NAIVE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?$/;
+
+type ParsedIso =
+  | { kind: "date"; date: string } // YYYY-MM-DD
+  | { kind: "datetime"; rfc3339: string; hasOffset: boolean };
+
+/**
+ * Parse a user-supplied ISO 8601 string into a normalised form.
+ * - "2024-01-15" → { kind: "date" }
+ * - "2024-01-15T09:00:00Z" or with offset → { kind: "datetime", hasOffset: true }
+ * - "2024-01-15T09:00:00" (naive) → { kind: "datetime", hasOffset: false } (needs a timeZone)
+ * Returns null on invalid input.
+ */
+function parseIso(input: string): ParsedIso | null {
+  if (typeof input !== "string") return null;
+  const s = input.trim();
+  if (ISO_DATE_ONLY_RE.test(s)) {
+    // Validate it's a real date
+    const d = new Date(`${s}T00:00:00Z`);
+    if (Number.isNaN(d.getTime())) return null;
+    return { kind: "date", date: s };
+  }
+  if (ISO_DATETIME_AWARE_RE.test(s)) {
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return null;
+    return { kind: "datetime", rfc3339: s, hasOffset: true };
+  }
+  if (ISO_DATETIME_NAIVE_RE.test(s)) {
+    // Don't construct a Date for naive forms (Date assumes local TZ, which is misleading).
+    return { kind: "datetime", rfc3339: s, hasOffset: false };
+  }
+  return null;
+}
+
+/**
+ * Given a naive ISO datetime ("YYYY-MM-DDTHH:MM[:SS]") and an IANA timezone,
+ * return an RFC3339 string with the correct offset for that wall-clock time.
+ */
+function attachOffsetForTimezone(naiveIso: string, timeZone: string): string {
+  if (timeZone === "UTC") return `${naiveIso}Z`;
+  // Construct a Date in the local environment; we don't actually use its absolute
+  // value, just its components-by-formatter result. Format the same wall-clock
+  // moment in the target zone to obtain the offset string.
+  const probe = new Date(naiveIso);
+  if (Number.isNaN(probe.getTime())) {
+    // Fall back to no offset; let the caller decide.
+    return naiveIso;
+  }
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    timeZoneName: "longOffset",
+  });
+  const offsetPart =
+    formatter.formatToParts(probe).find((p) => p.type === "timeZoneName")?.value || "";
+  const offset = offsetPart.replace("GMT", "").trim();
+  return `${naiveIso}${offset || "Z"}`;
+}
+
 interface ConferenceEntryPoint {
   entryPointType: string;
   uri: string;
@@ -493,7 +557,10 @@ export class GoogleCalendarTools {
   static getTools() {
     return {
       list_calendars: {
-        description: "List all calendars the user has access to. Use this to discover available calendars before performing calendar operations. The primary calendar (primary:true) is the user's main calendar. Other calendars may be shared, subscribed, or secondary calendars. The calendar ID is required for all other calendar operations.",
+        description:
+          "List all Google Calendars the authenticated user has access to (primary, shared, subscribed, secondary). " +
+          "Use this when the user names a calendar (e.g. \"my work calendar\", \"team calendar\") and you need its ID — but for the user's MAIN calendar you do NOT need to call this first: pass calendarId='primary' to the other tools. " +
+          "Returns up to `maxResults` items; if `nextPageToken` is returned, paginate by passing it back as `pageToken`.",
         readOnlyHint: true,
         outputSchema: {
           calendars: z.array(calendarSchema),
@@ -501,14 +568,14 @@ export class GoogleCalendarTools {
           message: z.string().optional(),
         },
         schema: {
-          maxResults: z.coerce.number().int().optional().default(100).describe('Number of calendars to return (1-250). Default: 100'),
-          pageToken: z.string().optional().describe('Pagination token from previous response to get next page'),
+          maxResults: z.coerce.number().int().positive().optional().default(100).describe('Calendars to return per page (1-250, clamped). Default: 100.'),
+          pageToken: z.string().optional().describe('Pagination token from a prior call\'s `nextPageToken`.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ maxResults, pageToken }: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const url = new URL('https://www.googleapis.com/calendar/v3/users/me/calendarList');
-            url.searchParams.set('maxResults', Math.min(maxResults, 250).toString());
+            url.searchParams.set('maxResults', Math.min(Math.max(1, maxResults), 250).toString());
             if (pageToken) url.searchParams.set('pageToken', pageToken);
 
             const res = await googleFetch(url.toString(), {
@@ -550,7 +617,14 @@ export class GoogleCalendarTools {
       },
 
       get_calendar_events: {
-        description: "Retrieve events from a specific calendar within a time range. Use this to view scheduled events, check availability, or find specific appointments. Times are interpreted in the provided timezone. Without dateMax, returns all future events from dateMin. IMPORTANT: For single day events, use next day as dateMax (e.g., dateMin='2024-01-15' and dateMax='2024-01-16'). Event IDs from this tool are required for update/delete operations.",
+        description:
+          "List events from a Google Calendar within a time range. Use this to read what's on a user's calendar — meetings, appointments, all-day events — for any date or range. " +
+          "Defaults to the user's primary calendar starting NOW; call list_calendars first only when you need a non-primary calendar's ID. " +
+          "Time inputs accept full ISO 8601 strings: 'YYYY-MM-DD' (treated as start of that day in `timeZone`), naive 'YYYY-MM-DDTHH:MM[:SS]' (combined with `timeZone`), or zone-aware '...Z' / '...±HH:MM'. " +
+          "Without `timeMax`, returns the next `maxResults` events from `timeMin` onwards. " +
+          "For a single calendar day, set `timeMin='2024-01-15'` and `timeMax='2024-01-16'` (end is EXCLUSIVE). " +
+          "If `nextPageToken` is returned, more events match — pass it back as `pageToken` to continue. " +
+          "Event `id`s in the response are required for update_event / delete_event.",
         readOnlyHint: true,
         outputSchema: {
           calendarId: z.string(),
@@ -559,55 +633,80 @@ export class GoogleCalendarTools {
           message: z.string().optional(),
         },
         schema: {
-          calendarId: z.string().describe('Calendar ID from list_calendars (required - get ID first using list_calendars)'),
-          maxResults: z.coerce.number().int().optional().default(10).describe('Number of events to return (1-2500). Default: 10'),
-          dateMin: z.string().describe('Start date YYYY-MM-DD (e.g., "2024-01-15"). Required'),
-          timeMin: z.string().describe('Start time HH:MM:SS (e.g., "09:00:00"). Required'),
-          dateMax: z.string().optional().describe('End date YYYY-MM-DD. Events BEFORE this date. For single day, use next day'),
-          timeMax: z.string().optional().describe('End time HH:MM:SS. Only valid with dateMax'),
-          timeZone: z.string().describe('Timezone for interpreting dates/times (e.g., "America/Los_Angeles", "UTC")'),
-          pageToken: z.string().optional().describe('Pagination token from previous response'),
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar ID. Defaults to "primary" (the user\'s main calendar). Use list_calendars to discover other calendar IDs.'),
+          maxResults: z.coerce.number().int().optional().default(10).describe('Number of events to return (1-2500). Default: 10. Google may return slightly fewer; check `nextPageToken`.'),
+          timeMin: z
+            .string()
+            .optional()
+            .describe(
+              'Lower time bound (inclusive) as ISO 8601: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM[:SS]", or "...Z"/"...±HH:MM". Defaults to NOW. Naive forms are interpreted in `timeZone`.'
+            ),
+          timeMax: z
+            .string()
+            .optional()
+            .describe(
+              'Upper time bound (EXCLUSIVE) as ISO 8601 — same formats as `timeMin`. Omit to retrieve future events from `timeMin`.'
+            ),
+          timeZone: z
+            .string()
+            .optional()
+            .default("UTC")
+            .describe('IANA timezone (e.g. "America/Los_Angeles") used to interpret naive/date-only inputs and to format response times. Default: UTC.'),
+          pageToken: z.string().optional().describe('Pagination token from a prior call\'s `nextPageToken`. Pass it back to fetch the next page.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, dateMin, timeMin, dateMax, timeMax, timeZone, pageToken }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, timeMin, timeMax, timeZone, pageToken }: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const encodedCalendarId = encodeURIComponent(calendarId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
 
-            url.searchParams.set('maxResults', Math.min(maxResults, 2500).toString());
+            url.searchParams.set('maxResults', Math.min(Math.max(1, maxResults), 2500).toString());
             url.searchParams.set('singleEvents', 'true');
             url.searchParams.set('orderBy', 'startTime');
             if (pageToken) url.searchParams.set('pageToken', pageToken);
             if (timeZone) url.searchParams.set('timeZone', timeZone);
 
-            // Helper to get timezone offset using Intl API ("-08:00" / "+05:30" / "Z").
-            const getOffset = (dateStr: string, timeStr: string, tz: string): string => {
-              if (tz === 'UTC') return 'Z';
-              const dateTime = new Date(`${dateStr}T${timeStr}`);
-              const formatter = new Intl.DateTimeFormat('en-US', {
-                timeZone: tz,
-                timeZoneName: 'longOffset'
-              });
-              const parts = formatter.formatToParts(dateTime);
-              const offsetPart = parts.find(p => p.type === 'timeZoneName')?.value || '';
-              const offset = offsetPart.replace('GMT', '').trim();
-              return offset || 'Z';
-            };
+            // Resolve timeMin (default = now in RFC3339).
+            let resolvedTimeMin: string;
+            if (!timeMin) {
+              resolvedTimeMin = new Date().toISOString();
+            } else {
+              const parsed = parseIso(timeMin);
+              if (!parsed) {
+                return errorResult({
+                  error: `Invalid timeMin "${timeMin}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
+                });
+              }
+              if (parsed.kind === "date") {
+                resolvedTimeMin = attachOffsetForTimezone(`${parsed.date}T00:00:00`, timeZone);
+              } else if (parsed.hasOffset) {
+                resolvedTimeMin = parsed.rfc3339;
+              } else {
+                resolvedTimeMin = attachOffsetForTimezone(parsed.rfc3339, timeZone);
+              }
+            }
+            url.searchParams.set('timeMin', resolvedTimeMin);
 
-            const minOffset = getOffset(dateMin, timeMin, timeZone);
-            const processedTimeMin = `${dateMin}T${timeMin}${minOffset}`;
-            url.searchParams.set('timeMin', processedTimeMin);
-
-            if (dateMax) {
-              const maxTime = timeMax || '00:00:00';
-              const maxOffset = getOffset(dateMax, maxTime, timeZone);
-              const processedTimeMax = `${dateMax}T${maxTime}${maxOffset}`;
-              url.searchParams.set('timeMax', processedTimeMax);
-            } else if (timeMax) {
-              return errorResult({
-                error: "timeMax requires dateMax to be specified",
-                hint: "Pass both dateMax (YYYY-MM-DD) and optionally timeMax (HH:MM:SS), or pass neither."
-              });
+            if (timeMax) {
+              const parsedMax = parseIso(timeMax);
+              if (!parsedMax) {
+                return errorResult({
+                  error: `Invalid timeMax "${timeMax}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
+                });
+              }
+              let resolvedTimeMax: string;
+              if (parsedMax.kind === "date") {
+                resolvedTimeMax = attachOffsetForTimezone(`${parsedMax.date}T00:00:00`, timeZone);
+              } else if (parsedMax.hasOffset) {
+                resolvedTimeMax = parsedMax.rfc3339;
+              } else {
+                resolvedTimeMax = attachOffsetForTimezone(parsedMax.rfc3339, timeZone);
+              }
+              url.searchParams.set('timeMax', resolvedTimeMax);
             }
 
             const res = await googleFetch(url.toString(), {
@@ -632,7 +731,7 @@ export class GoogleCalendarTools {
                 calendarId,
                 events: [] as any[],
                 nextPageToken: null,
-                message: `No events found in calendar "${calendarId}"${dateMin || dateMax ? ' for the specified time range' : ''}`
+                message: `No events found in calendar "${calendarId}" for the specified time range`
               });
             }
 
@@ -672,7 +771,13 @@ export class GoogleCalendarTools {
       },
 
       create_event: {
-        description: "Create a new calendar event. Use this to schedule meetings, appointments, or all-day events. For all-day events, only provide dates (end date is EXCLUSIVE - use '2024-01-16' for a single day event on Jan 15). For timed events, both start and end times are required. Can optionally invite attendees with email notifications. The created event ID can be used for future updates or deletion.",
+        description:
+          "Create a new calendar event (meeting, appointment, or all-day block). " +
+          "Pass `start` and `end` as ISO 8601 strings: use a date-only form ('YYYY-MM-DD') for an ALL-DAY event (end is EXCLUSIVE — use the day after the last day), or a datetime ('YYYY-MM-DDTHH:MM[:SS]' with optional 'Z'/'±HH:MM' offset) for a TIMED event. " +
+          "Both `start` and `end` must be the same kind. Naive datetimes are interpreted in `timeZone`. " +
+          "`description` is rendered through Markdown to HTML by the server. " +
+          "When `attendees` are provided, Google sends invitations according to `sendUpdates` (default 'all'). " +
+          "Returns the created event including `id` which is required for update_event / delete_event.",
         outputSchema: {
           id: z.string(),
           summary: z.string(),
@@ -687,25 +792,57 @@ export class GoogleCalendarTools {
           status: z.string().optional(),
         },
         schema: {
-          calendarId: z.string().describe('Calendar ID from list_calendars (required - get ID first using list_calendars)'),
-          summary: z.string().describe('Event title'),
-          description: z.string().optional().describe('Event description. Supports markdown formatting'),
-          location: z.string().optional().describe('Event location (address or meeting room)'),
-          startDate: z.string().describe('Start date YYYY-MM-DD (e.g., "2024-01-15")'),
-          startTime: z.string().optional().describe('Start time HH:MM:SS (e.g., "14:00:00"). Omit for all-day events'),
-          endDate: z.string().describe('End date YYYY-MM-DD. For all-day: next day. For timed: same or later day'),
-          endTime: z.string().optional().describe('End time HH:MM:SS (e.g., "15:00:00"). Required if startTime provided'),
-          timeZone: z.string().describe('Timezone (e.g., "America/Los_Angeles", "UTC", "Europe/London")'),
-          attendees: z.array(z.string()).optional().describe('Email addresses of attendees to invite'),
-          sendUpdates: z.enum(['all', 'externalOnly', 'none']).optional().default('all').describe('all: notify everyone, externalOnly: only external users, none: no notifications'),
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar ID. Defaults to "primary". Use list_calendars to discover other calendar IDs.'),
+          summary: z.string().describe('Event title (required).'),
+          description: z.string().optional().describe('Event description. Rendered as Markdown to HTML by the server.'),
+          location: z.string().optional().describe('Event location (address, meeting room, etc.).'),
+          start: z
+            .string()
+            .describe(
+              'Start as ISO 8601. Date-only ("2024-01-15") creates an all-day event. Datetime ("2024-01-15T14:00:00" or "2024-01-15T14:00:00-08:00") creates a timed event. Naive datetimes are interpreted in `timeZone`.'
+            ),
+          end: z
+            .string()
+            .describe(
+              'End as ISO 8601, same kind as `start`. For all-day, end date is EXCLUSIVE (use the next day for a single-day event). For timed, must be after `start`.'
+            ),
+          timeZone: z
+            .string()
+            .optional()
+            .default("UTC")
+            .describe('IANA timezone (e.g. "America/Los_Angeles"). Used when `start`/`end` are naive datetimes or date-only. Default: UTC.'),
+          attendees: z.array(z.string()).optional().describe('Email addresses of attendees to invite.'),
+          sendUpdates: z
+            .enum(['all', 'externalOnly', 'none'])
+            .optional()
+            .default('all')
+            .describe('Invitation behaviour. all: notify everyone, externalOnly: only non-Google-Calendar users, none: no notifications.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const {
               calendarId, summary, description, location,
-              startDate, startTime, endDate, endTime, timeZone, attendees, sendUpdates
+              start, end, timeZone, attendees, sendUpdates
             } = params;
+
+            const parsedStart = parseIso(start);
+            const parsedEnd = parseIso(end);
+            if (!parsedStart) {
+              return errorResult({ error: `Invalid \`start\` "${start}". Expected ISO 8601 (date or datetime).` });
+            }
+            if (!parsedEnd) {
+              return errorResult({ error: `Invalid \`end\` "${end}". Expected ISO 8601 (date or datetime).` });
+            }
+            if (parsedStart.kind !== parsedEnd.kind) {
+              return errorResult({
+                error: "`start` and `end` must be the same kind (both date-only for all-day, or both datetime for timed).",
+              });
+            }
 
             const event: any = {
               summary,
@@ -713,27 +850,18 @@ export class GoogleCalendarTools {
               location,
             };
 
-            const isAllDay = !startTime && !endTime;
-
-            if (isAllDay) {
-              event.start = { date: startDate };
-              event.end = { date: endDate };
-            } else {
-              if (!startTime || !endTime) {
-                return errorResult({
-                  error: "For timed events, both startTime and endTime must be provided.",
-                  hint: "For all-day events, omit BOTH startTime and endTime. For timed events, provide BOTH."
-                });
-              }
-              const startDateTime = `${startDate}T${startTime}`;
-              const endDateTime = `${endDate}T${endTime}`;
+            if (parsedStart.kind === "date" && parsedEnd.kind === "date") {
+              event.start = { date: parsedStart.date };
+              event.end = { date: parsedEnd.date };
+            } else if (parsedStart.kind === "datetime" && parsedEnd.kind === "datetime") {
+              // For Calendar API, send the dateTime as-is and let timeZone disambiguate naive forms.
               event.start = {
-                dateTime: startDateTime,
-                ...(timeZone && { timeZone })
+                dateTime: parsedStart.rfc3339,
+                ...(timeZone && { timeZone }),
               };
               event.end = {
-                dateTime: endDateTime,
-                ...(timeZone && { timeZone })
+                dateTime: parsedEnd.rfc3339,
+                ...(timeZone && { timeZone }),
               };
             }
 
@@ -791,7 +919,12 @@ export class GoogleCalendarTools {
       },
 
       update_event: {
-        description: "Update an existing event by eventId. Dates/times are interpreted in the provided timezone. Can update individual fields (summary, description, location) OR update times (must provide all: startDate, endDate, and optionally startTime, endTime). WARNING: Empty strings/arrays CLEAR fields. Cannot move between calendars. Returns updated event {id, summary, start, end, updated, ...}.",
+        description:
+          "Patch fields on an existing Google Calendar event by `eventId`. " +
+          "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
+          "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
+          "`description` is rendered through Markdown to HTML by the server. " +
+          "Cannot move an event between calendars. Returns the updated event including a fresh `updated` timestamp.",
         outputSchema: {
           id: z.string(),
           summary: z.string(),
@@ -807,25 +940,48 @@ export class GoogleCalendarTools {
           updated: z.string().optional(),
         },
         schema: {
-          calendarId: z.string().describe('Calendar ID from list_calendars'),
-          eventId: z.string().describe('Event ID to update'),
-          summary: z.string().optional().describe('Event title/summary'),
-          description: z.string().optional().describe('Event description'),
-          location: z.string().optional().describe('Event location'),
-          startDate: z.string().optional().describe('Start date in YYYY-MM-DD format (e.g., "2024-01-15"). Required if updating time'),
-          startTime: z.string().optional().describe('Start time in HH:MM:SS format (e.g., "14:00:00"). Omit for all-day events'),
-          endDate: z.string().optional().describe('End date in YYYY-MM-DD format (e.g., "2024-01-16" for all-day or "2024-01-15" for timed). Required if updating time'),
-          endTime: z.string().optional().describe('End time in HH:MM:SS format (e.g., "15:00:00"). Omit for all-day events'),
-          timeZone: z.string().describe('Timezone for interpreting dates and times (e.g., "America/Los_Angeles", "UTC", "Europe/London")'),
-          attendees: z.array(z.string()).optional().describe('Array of attendee email addresses (replaces existing attendees)'),
-          sendUpdates: z.enum(['all', 'externalOnly', 'none']).optional().default('all').describe('Whether to send update notifications (all: notify all attendees, externalOnly: only non-Google Calendar users, none: no notifications)'),
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar containing the event. Defaults to "primary".'),
+          eventId: z.string().describe('Event ID (from get_calendar_events or create_event).'),
+          summary: z.string().optional().describe('New event title.'),
+          description: z.string().optional().describe('New description. Rendered as Markdown to HTML server-side. Pass an empty string to clear.'),
+          location: z.string().optional().describe('New location. Pass an empty string to clear.'),
+          start: z
+            .string()
+            .optional()
+            .describe(
+              'New start as ISO 8601 — date-only for all-day, datetime for timed. Must be paired with `end` of the same kind. Omit to leave the schedule unchanged.'
+            ),
+          end: z
+            .string()
+            .optional()
+            .describe(
+              'New end as ISO 8601, same kind as `start`. Required if `start` is provided.'
+            ),
+          timeZone: z
+            .string()
+            .optional()
+            .default("UTC")
+            .describe('IANA timezone used to interpret naive `start`/`end` datetimes. Default: UTC.'),
+          attendees: z
+            .array(z.string())
+            .optional()
+            .describe('Replaces the attendee list with the given emails. Pass [] to remove all attendees.'),
+          sendUpdates: z
+            .enum(['all', 'externalOnly', 'none'])
+            .optional()
+            .default('all')
+            .describe('Notification behaviour. all / externalOnly / none.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const {
               calendarId, eventId, summary, description, location,
-              startDate, startTime, endDate, endTime, timeZone, attendees, sendUpdates
+              start, end, timeZone, attendees, sendUpdates
             } = params;
 
             const updates: any = {};
@@ -833,43 +989,42 @@ export class GoogleCalendarTools {
             if (description !== undefined) updates.description = md.render(description);
             if (location !== undefined) updates.location = location;
 
-            const hasDateFields = startDate !== undefined || endDate !== undefined;
-            const hasTimeFields = startTime !== undefined || endTime !== undefined;
+            const hasStart = start !== undefined;
+            const hasEnd = end !== undefined;
 
-            if (hasDateFields) {
-              if (!startDate || !endDate) {
+            if (hasStart !== hasEnd) {
+              return errorResult({
+                error: "To reschedule, provide BOTH `start` and `end`. To leave the schedule unchanged, omit BOTH.",
+              });
+            }
+
+            if (hasStart && hasEnd) {
+              const parsedStart = parseIso(start);
+              const parsedEnd = parseIso(end);
+              if (!parsedStart) {
+                return errorResult({ error: `Invalid \`start\` "${start}". Expected ISO 8601.` });
+              }
+              if (!parsedEnd) {
+                return errorResult({ error: `Invalid \`end\` "${end}". Expected ISO 8601.` });
+              }
+              if (parsedStart.kind !== parsedEnd.kind) {
                 return errorResult({
-                  error: "When updating event dates, BOTH startDate and endDate must be provided.",
-                  hint: "To leave the date unchanged, omit both startDate and endDate."
+                  error: "`start` and `end` must be the same kind (both date-only or both datetime).",
                 });
               }
-              const isAllDay = !startTime && !endTime;
-              if (isAllDay) {
-                updates.start = { date: startDate };
-                updates.end = { date: endDate };
-              } else {
-                if (!startTime || !endTime) {
-                  return errorResult({
-                    error: "For timed events, both startTime and endTime must be provided.",
-                    hint: "Provide BOTH startTime and endTime, or omit BOTH for an all-day event."
-                  });
-                }
-                const startDateTime = `${startDate}T${startTime}`;
-                const endDateTime = `${endDate}T${endTime}`;
+              if (parsedStart.kind === "date" && parsedEnd.kind === "date") {
+                updates.start = { date: parsedStart.date };
+                updates.end = { date: parsedEnd.date };
+              } else if (parsedStart.kind === "datetime" && parsedEnd.kind === "datetime") {
                 updates.start = {
-                  dateTime: startDateTime,
-                  ...(timeZone && { timeZone })
+                  dateTime: parsedStart.rfc3339,
+                  ...(timeZone && { timeZone }),
                 };
                 updates.end = {
-                  dateTime: endDateTime,
-                  ...(timeZone && { timeZone })
+                  dateTime: parsedEnd.rfc3339,
+                  ...(timeZone && { timeZone }),
                 };
               }
-            } else if (hasTimeFields) {
-              return errorResult({
-                error: "Time fields cannot be updated without date fields.",
-                hint: "Re-pass the event's existing date(s) along with the new startTime/endTime."
-              });
             }
 
             if (attendees !== undefined) {
@@ -928,7 +1083,11 @@ export class GoogleCalendarTools {
       },
 
       delete_event: {
-        description: "Permanently delete an event by eventId (no undo). Sends cancellation notifications to attendees by default (control with sendUpdates). Returns {success: true, eventId, message} on success.",
+        description:
+          "Permanently delete an event by `eventId` — there is NO undo. " +
+          "Sends cancellation notifications to attendees by default; set `sendUpdates: 'none'` to delete silently. " +
+          "Returns {success, eventId, message} on success. " +
+          "If the event was already deleted, Google returns 410 and this tool surfaces a structured error — do not retry.",
         destructiveHint: true,
         outputSchema: {
           success: z.boolean(),
@@ -936,9 +1095,17 @@ export class GoogleCalendarTools {
           message: z.string(),
         },
         schema: {
-          calendarId: z.string().describe('Calendar ID from list_calendars'),
-          eventId: z.string().describe('Event ID to delete'),
-          sendUpdates: z.enum(['all', 'externalOnly', 'none']).optional().default('all').describe('Whether to send cancellation notifications (all: notify all attendees, externalOnly: only non-Google Calendar users, none: no notifications)'),
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar containing the event. Defaults to "primary".'),
+          eventId: z.string().describe('Event ID to delete (from get_calendar_events or create_event).'),
+          sendUpdates: z
+            .enum(['all', 'externalOnly', 'none'])
+            .optional()
+            .default('all')
+            .describe('Cancellation notification behaviour. all / externalOnly / none.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
@@ -977,28 +1144,65 @@ export class GoogleCalendarTools {
       },
 
       get_next_availability: {
-        description: "Find next 10 available time slots in a calendar. Searches up to 30 days ahead. Returns {availableSlots: [{start, end}...], searchedUntil} with times in the specified timezone. Use searchedUntil with new startFromDate/Time to paginate. Can restrict to specific hours/days. Slots align to startTimeIncrement boundaries.",
+        description:
+          "Find the next available time slots in a single calendar by scanning Google's free/busy data. " +
+          "Pass `startFrom` as ISO 8601 (date-only, naive datetime, or with offset). Defaults to NOW. " +
+          "`duration` is the desired meeting length in minutes. " +
+          "Restrict to a daily window via `searchHoursStart`/`searchHoursEnd` (HH:MM[:SS] in `timezone`). " +
+          "Restrict to specific weekdays via `includeDays` (default: Mon-Fri). " +
+          "Slots align to `startTimeIncrement` (default 30 min) boundaries. " +
+          "Returns up to `maxResults` slots (default 10) and a boolean `exhausted` flag — when `exhausted` is true, the full search window was scanned and no more slots exist; when false, paginate by calling again with `startFrom = searchedUntil`. " +
+          "CAVEAT: free/busy reflects ONLY the listed calendar — meetings on other calendars the user attends are NOT considered. Surface this to the user before confirming a slot.",
         readOnlyHint: true,
         outputSchema: {
+          calendarId: z.string(),
           availableSlots: z.array(z.object({
             start: formattedDateTimeSchema,
             end: formattedDateTimeSchema,
           })),
           searchedUntil: z.string(),
+          exhausted: z.boolean(),
         },
         schema: {
-          duration: z.coerce.number().int().describe('Duration of the meeting in minutes (e.g., 30, 60, 90)'),
-          timezone: z.string().describe('Time zone for all operations (IANA format, e.g., "America/New_York")'),
-          searchHoursStart: z.string().optional().describe('Daily search window start time in HH:MM:SS format (e.g., "09:00:00"). If not provided, searches all hours'),
-          searchHoursEnd: z.string().optional().describe('Daily search window end time in HH:MM:SS format (e.g., "17:00:00"). If not provided, searches all hours'),
-          includeDays: z.array(z.enum(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']))
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar ID. Defaults to "primary".'),
+          duration: z.coerce.number().int().positive().describe('Meeting length in minutes (e.g., 30, 60, 90). Required.'),
+          timezone: z.string().describe('IANA timezone (e.g., "America/New_York", "UTC"). Used for `searchHoursStart`/`searchHoursEnd` and to format response times.'),
+          startFrom: z
+            .string()
+            .optional()
+            .describe('Start searching from this ISO 8601 instant. Date-only ("YYYY-MM-DD") starts at 00:00:00 in `timezone`. Datetime forms work too. Defaults to NOW.'),
+          searchHoursStart: z
+            .string()
+            .optional()
+            .describe('Daily window start as HH:MM[:SS] in `timezone` (e.g. "09:00"). If omitted, all hours are considered.'),
+          searchHoursEnd: z
+            .string()
+            .optional()
+            .describe('Daily window end as HH:MM[:SS] in `timezone` (e.g. "17:00"). If omitted, all hours are considered.'),
+          includeDays: z
+            .array(z.enum(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']))
             .optional()
             .default(['Mon', 'Tue', 'Wed', 'Thu', 'Fri'])
-            .describe('Days of the week to include in search (default: weekdays only)'),
-          startFromDate: z.string().describe('Start searching from this date in YYYY-MM-DD format (e.g., "2024-01-15")'),
-          startFromTime: z.string().describe('Start searching from this time in HH:MM:SS format (e.g., "09:00:00")'),
-          startTimeIncrement: z.coerce.number().int().optional().default(30).describe('Increment between possible start times in minutes (e.g., 15 for every 15 minutes, 30 for every half-hour)'),
-          calendarId: z.string().describe('Calendar ID from list_calendars'),
+            .describe('Weekdays to include. Default: weekdays only.'),
+          startTimeIncrement: z
+            .coerce.number().int().positive()
+            .optional()
+            .default(30)
+            .describe('Minutes between candidate start times (e.g. 15, 30). Default 30.'),
+          maxResults: z
+            .coerce.number().int().positive()
+            .optional()
+            .default(10)
+            .describe('Maximum slots to return. Default 10.'),
+          maxSearchDays: z
+            .coerce.number().int().positive().max(365)
+            .optional()
+            .default(30)
+            .describe('Maximum days ahead of `startFrom` to scan. Default 30, hard cap 365.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async (params: any, context: any) => {
           try {
@@ -1009,17 +1213,38 @@ export class GoogleCalendarTools {
               searchHoursStart,
               searchHoursEnd,
               includeDays,
-              startFromDate,
-              startFromTime,
+              startFrom,
               startTimeIncrement,
-              calendarId
+              calendarId,
+              maxResults,
+              maxSearchDays,
             } = params;
 
-            const startDateTime = `${startFromDate}T${startFromTime}`;
-            const searchStart = new Date(startDateTime);
+            // Resolve startFrom — default to now.
+            let searchStart: Date;
+            if (!startFrom) {
+              searchStart = new Date();
+            } else {
+              const parsed = parseIso(startFrom);
+              if (!parsed) {
+                return errorResult({
+                  error: `Invalid \`startFrom\` "${startFrom}". Expected ISO 8601 (date or datetime).`,
+                });
+              }
+              let resolved: string;
+              if (parsed.kind === "date") {
+                resolved = attachOffsetForTimezone(`${parsed.date}T00:00:00`, timezone);
+              } else if (parsed.hasOffset) {
+                resolved = parsed.rfc3339;
+              } else {
+                resolved = attachOffsetForTimezone(parsed.rfc3339, timezone);
+              }
+              searchStart = new Date(resolved);
+              if (Number.isNaN(searchStart.getTime())) {
+                return errorResult({ error: `Could not interpret \`startFrom\` "${startFrom}" in timezone "${timezone}".` });
+              }
+            }
 
-            // We'll search up to 30 days ahead to find 10 available slots
-            const maxSearchDays = 30;
             const searchEnd = new Date(searchStart);
             searchEnd.setDate(searchEnd.getDate() + maxSearchDays);
 
@@ -1093,7 +1318,7 @@ export class GoogleCalendarTools {
             // Find available slots
             const availableSlots: Array<{ start: FormattedDateTime; end: FormattedDateTime }> = [];
             let currentTime = new Date(searchStart);
-            let searchedUntil = searchStart;
+            let searchedUntil = new Date(searchStart);
 
             // Helper function to check if a time is within search hours
             const isWithinSearchHours = (date: Date, tz: string): boolean => {
@@ -1126,15 +1351,15 @@ export class GoogleCalendarTools {
               let startSeconds = 0;
               let endSeconds = 24 * 3600; // Default to end of day
               
-              if (searchHoursStart) {
-                const [startH, startM, startS] = searchHoursStart.split(':').map(Number);
-                startSeconds = startH * 3600 + startM * 60 + startS;
-              }
-              
-              if (searchHoursEnd) {
-                const [endH, endM, endS] = searchHoursEnd.split(':').map(Number);
-                endSeconds = endH * 3600 + endM * 60 + endS;
-              }
+              const parseHms = (s: string): number => {
+                const [h = 0, m = 0, sec = 0] = s.split(':').map((v) => {
+                  const n = Number(v);
+                  return Number.isFinite(n) ? n : 0;
+                });
+                return h * 3600 + m * 60 + sec;
+              };
+              if (searchHoursStart) startSeconds = parseHms(searchHoursStart);
+              if (searchHoursEnd) endSeconds = parseHms(searchHoursEnd);
               
               // Check if within search hours
               return currentTimeInSeconds >= startSeconds && currentTimeInSeconds < endSeconds;
@@ -1180,7 +1405,7 @@ export class GoogleCalendarTools {
             };
 
             // Search for available slots
-            while (availableSlots.length < 10 && currentTime < searchEnd) {
+            while (availableSlots.length < maxResults && currentTime < searchEnd) {
               // Align to next slot boundary
               const minutes = currentTime.getMinutes();
               const remainder = minutes % startTimeIncrement;
@@ -1227,14 +1452,23 @@ export class GoogleCalendarTools {
               currentTime = advanceToNextSlot(currentTime);
             }
 
-            // Update searchedUntil to be the last time we checked
+            // Update searchedUntil to be the last time we checked.
+            // Clamp to searchEnd so we never report a value past the window.
             if (currentTime > searchedUntil) {
               searchedUntil = currentTime;
             }
+            if (searchedUntil > searchEnd) {
+              searchedUntil = searchEnd;
+            }
+
+            // exhausted: we walked off the end of the window without filling maxResults.
+            const exhausted = availableSlots.length < maxResults;
 
             return okResult({
+              calendarId,
               availableSlots,
-              searchedUntil: toLocalISO(searchedUntil, timezone)
+              searchedUntil: toLocalISO(searchedUntil, timezone),
+              exhausted,
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in get_next_availability: ${error?.message || String(error)}` });
