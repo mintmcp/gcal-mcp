@@ -1328,7 +1328,6 @@ export class GoogleCalendarTools {
             // Find available slots
             const availableSlots: Array<{ start: FormattedDateTime; end: FormattedDateTime }> = [];
             let currentTime = new Date(searchStart);
-            let searchedUntil = new Date(searchStart);
 
             // Helper function to check if a time is within search hours
             const isWithinSearchHours = (date: Date, tz: string): boolean => {
@@ -1454,7 +1453,6 @@ export class GoogleCalendarTools {
                       dayOfWeek: this.getDayOfWeek(endISO)
                     }
                   });
-                  searchedUntil = slotEnd;
                 }
               }
 
@@ -1462,14 +1460,10 @@ export class GoogleCalendarTools {
               currentTime = advanceToNextSlot(currentTime);
             }
 
-            // Update searchedUntil to be the last time we checked.
-            // Clamp to searchEnd so we never report a value past the window.
-            if (currentTime > searchedUntil) {
-              searchedUntil = currentTime;
-            }
-            if (searchedUntil > searchEnd) {
-              searchedUntil = searchEnd;
-            }
+            // searchedUntil = the next position the search WOULD consider next.
+            // For pagination, callers can pass this back as `startFrom` to resume.
+            // Clamp to searchEnd so we never report past the window boundary.
+            const searchedUntil = currentTime > searchEnd ? searchEnd : currentTime;
 
             // exhausted: we walked off the end of the window without filling maxResults.
             const exhausted = availableSlots.length < maxResults;
