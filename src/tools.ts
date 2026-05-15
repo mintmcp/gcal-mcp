@@ -966,7 +966,7 @@ export class GoogleCalendarTools {
           "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
           "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
           "`description` is rendered through Markdown to HTML by the server. " +
-          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction (each attendee re-receives an invitation). To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. " +
+          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. " +
           "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
         outputSchema: {
           id: z.string(),
