@@ -664,6 +664,7 @@ export class GoogleCalendarTools {
           "Without `timeMax`, returns the next `maxResults` events from `timeMin` onwards. " +
           "For a single calendar day, set `timeMin='2024-01-15'` and `timeMax='2024-01-16'` (end is EXCLUSIVE). " +
           "If `nextPageToken` is returned, more events match — pass it back as `pageToken` to continue. " +
+          "Recurring events are returned as expanded instances; each `id` (which may contain a date suffix) targets that single occurrence in update_event/delete_event. " +
           "Event `id`s in the response are required for update_event / delete_event.",
         readOnlyHint: true,
         outputSchema: {
@@ -965,7 +966,8 @@ export class GoogleCalendarTools {
           "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
           "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
           "`description` is rendered through Markdown to HTML by the server. " +
-          "Cannot move an event between calendars. Returns the updated event including a fresh `updated` timestamp.",
+          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction (each attendee re-receives an invitation). To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. " +
+          "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
         outputSchema: {
           id: z.string(),
           summary: z.string(),
