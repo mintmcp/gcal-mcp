@@ -9,6 +9,275 @@ const md = new MarkdownIt({
   breaks: true
 });
 
+// ---------- Shared Google API helpers ----------
+
+const GOOGLE_FETCH_TIMEOUT_MS = 25_000;
+
+type GoogleFetchResult =
+  | {
+      ok: true;
+      status: number;
+      headers: Headers;
+      bodyText: string;
+      bodyJson: unknown;
+    }
+  | {
+      ok: false;
+      kind: "http" | "network" | "timeout" | "parse";
+      status: number; // 0 when no HTTP response was received
+      statusText: string;
+      headers?: Headers;
+      bodyText: string;
+      bodyJson?: unknown;
+      retryAfterSeconds?: number;
+      cause?: string;
+    };
+
+/**
+ * Wraps fetch with an AbortController timeout and safe body parsing.
+ * Never throws — returns a discriminated result the caller can pattern-match on.
+ */
+async function googleFetch(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = GOOGLE_FETCH_TIMEOUT_MS
+): Promise<GoogleFetchResult> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url, { ...init, signal: ac.signal });
+  } catch (err: any) {
+    clearTimeout(timer);
+    const aborted = err?.name === "AbortError";
+    return {
+      ok: false,
+      kind: aborted ? "timeout" : "network",
+      status: 0,
+      statusText: aborted ? "Request Timeout" : "Network Error",
+      bodyText: "",
+      cause: err?.message ? String(err.message) : String(err),
+    };
+  }
+  clearTimeout(timer);
+
+  // Read body once as text, then attempt JSON parse.
+  let bodyText = "";
+  try {
+    bodyText = await response.text();
+  } catch (err: any) {
+    return {
+      ok: false,
+      kind: "parse",
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+      bodyText: "",
+      cause: err?.message ? String(err.message) : String(err),
+    };
+  }
+
+  let bodyJson: unknown = undefined;
+  if (bodyText.length > 0) {
+    try {
+      bodyJson = JSON.parse(bodyText);
+    } catch {
+      // Non-JSON body (e.g. HTML error page from an upstream proxy).
+      bodyJson = undefined;
+    }
+  }
+
+  if (!response.ok) {
+    const retryAfterRaw = response.headers.get("Retry-After");
+    let retryAfterSeconds: number | undefined;
+    if (retryAfterRaw) {
+      const n = Number(retryAfterRaw);
+      if (Number.isFinite(n) && n >= 0) {
+        retryAfterSeconds = Math.ceil(n);
+      } else {
+        // HTTP-date form — convert to seconds from now (clamped to >= 0).
+        const t = Date.parse(retryAfterRaw);
+        if (!Number.isNaN(t)) {
+          retryAfterSeconds = Math.max(0, Math.ceil((t - Date.now()) / 1000));
+        }
+      }
+    }
+    return {
+      ok: false,
+      kind: "http",
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+      bodyText,
+      bodyJson,
+      retryAfterSeconds,
+    };
+  }
+
+  return {
+    ok: true,
+    status: response.status,
+    headers: response.headers,
+    bodyText,
+    bodyJson,
+  };
+}
+
+interface GoogleErrorContext {
+  /** Human-readable name of the resource for 404 wording (e.g. "calendar", "event"). */
+  resource?: string;
+  /** Resource identifier to interpolate into the error message. */
+  resourceId?: string;
+  /** Operation verb for fallback messaging (e.g. "fetch calendars", "create event"). */
+  operation: string;
+}
+
+/**
+ * Maps a non-2xx GoogleFetchResult to a structured JSON error payload with
+ * status-specific guidance. Returns an object suitable for `errorResult()`.
+ */
+function mapGoogleError(
+  result: Extract<GoogleFetchResult, { ok: false }>,
+  ctx: GoogleErrorContext
+): Record<string, unknown> {
+  // Try to extract Google's structured error message.
+  let googleMessage: string | undefined;
+  let googleReason: string | undefined;
+  const body = result.bodyJson as any;
+  if (body && typeof body === "object") {
+    if (typeof body.error?.message === "string") {
+      googleMessage = body.error.message;
+    }
+    if (Array.isArray(body.error?.errors) && body.error.errors.length > 0) {
+      const first = body.error.errors[0];
+      if (typeof first?.reason === "string") googleReason = first.reason;
+    }
+  }
+
+  const base: Record<string, unknown> = {
+    operation: ctx.operation,
+    status: result.status,
+    statusText: result.statusText,
+  };
+  if (ctx.resource) base.resource = ctx.resource;
+  if (ctx.resourceId) base.resourceId = ctx.resourceId;
+  if (googleMessage) base.googleMessage = googleMessage;
+  if (googleReason) base.googleReason = googleReason;
+  if (result.retryAfterSeconds !== undefined) {
+    base.retryAfterSeconds = result.retryAfterSeconds;
+  }
+
+  if (result.kind === "timeout") {
+    return {
+      ...base,
+      transient: true,
+      error: `Timed out while trying to ${ctx.operation}. The Google Calendar API did not respond within ${GOOGLE_FETCH_TIMEOUT_MS / 1000}s. Retry once; if it persists, surface the issue to the user.`,
+    };
+  }
+  if (result.kind === "network") {
+    return {
+      ...base,
+      transient: true,
+      error: `Network error while trying to ${ctx.operation}: ${result.cause || "unknown"}. Retry once before surfacing to the user.`,
+    };
+  }
+  if (result.kind === "parse") {
+    return {
+      ...base,
+      transient: true,
+      error: `Could not read response body while trying to ${ctx.operation}: ${result.cause || "unknown"}.`,
+    };
+  }
+
+  // HTTP error: status-specific guidance.
+  const resLabel = ctx.resource && ctx.resourceId
+    ? `${ctx.resource} "${ctx.resourceId}"`
+    : ctx.resource || "resource";
+
+  switch (result.status) {
+    case 400:
+      return {
+        ...base,
+        error: `Invalid request to ${ctx.operation}: ${googleMessage || result.bodyText || "Google rejected the request as malformed."} Check parameter formats (ISO 8601 datetimes, valid timezone identifiers, time ranges).`,
+      };
+    case 401:
+      return {
+        ...base,
+        error: `Authentication failed while trying to ${ctx.operation}. The user's Google session is invalid or expired and they need to re-authenticate. Do NOT retry — surface this to the user.`,
+      };
+    case 403: {
+      // Distinguish rate-limit 403 from permission 403.
+      const isRateLimit =
+        googleReason === "rateLimitExceeded" ||
+        googleReason === "userRateLimitExceeded" ||
+        googleReason === "quotaExceeded";
+      if (isRateLimit) {
+        return {
+          ...base,
+          transient: true,
+          error: `Google Calendar rate limit hit while trying to ${ctx.operation}${result.retryAfterSeconds !== undefined ? ` (retry after ${result.retryAfterSeconds}s)` : ""}. Back off and try again.`,
+        };
+      }
+      return {
+        ...base,
+        error: `Access denied for ${resLabel} while trying to ${ctx.operation}. The authenticated user does not have permission for this operation. Do NOT retry without changing input.`,
+      };
+    }
+    case 404:
+      return {
+        ...base,
+        error: `${resLabel} not found while trying to ${ctx.operation}. Verify the ID is correct (use list_calendars / get_calendar_events to look it up).`,
+      };
+    case 409:
+      return {
+        ...base,
+        error: `Conflict while trying to ${ctx.operation}: ${googleMessage || "the resource may have been modified concurrently or the ID is already in use."}`,
+      };
+    case 410:
+      return {
+        ...base,
+        error: `${resLabel} is gone (HTTP 410). It was likely already deleted. Do NOT retry.`,
+      };
+    case 429:
+      return {
+        ...base,
+        transient: true,
+        error: `Google Calendar rate limit hit (HTTP 429) while trying to ${ctx.operation}${result.retryAfterSeconds !== undefined ? `. Wait ${result.retryAfterSeconds}s before retrying.` : ". Back off and retry."}`,
+      };
+    case 500:
+    case 502:
+    case 503:
+    case 504:
+      return {
+        ...base,
+        transient: true,
+        error: `Google Calendar is temporarily unavailable (HTTP ${result.status}) while trying to ${ctx.operation}${result.retryAfterSeconds !== undefined ? `. Wait ${result.retryAfterSeconds}s before retrying.` : ". Retry once after a short delay."}`,
+      };
+    default:
+      return {
+        ...base,
+        error: `Unexpected HTTP ${result.status} (${result.statusText}) while trying to ${ctx.operation}: ${googleMessage || result.bodyText || "no error body"}.`,
+      };
+  }
+}
+
+/** Build a tool error result with a JSON-stringified body. */
+function errorResult(payload: Record<string, unknown> | string) {
+  const body = typeof payload === "string" ? { error: payload } : payload;
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(body, null, 2) }],
+    isError: true as const,
+  };
+}
+
+/** Build a tool success result with structured content. */
+function okResult<T extends Record<string, unknown>>(structured: T) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(structured, null, 2) }],
+    structuredContent: structured,
+  };
+}
+
 interface ConferenceEntryPoint {
   entryPointType: string;
   uri: string;
@@ -237,61 +506,33 @@ export class GoogleCalendarTools {
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ maxResults, pageToken }: any, context: any) => {
           try {
-            // The accessToken in context is the actual Google token for API calls
-            const googleToken = context?.accessToken;
-            if (!googleToken) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Provider access token not available",
-                  },
-                ],
-                isError: true,
-              };
-            }
-
+            const googleToken = context.accessToken;
             const url = new URL('https://www.googleapis.com/calendar/v3/users/me/calendarList');
-            
-            // Set pagination parameters
             url.searchParams.set('maxResults', Math.min(maxResults, 250).toString());
             if (pageToken) url.searchParams.set('pageToken', pageToken);
-            const response = await fetch(url.toString(), {
+
+            const res = await googleFetch(url.toString(), {
               headers: {
                 'Authorization': `Bearer ${googleToken}`,
                 'Accept': 'application/json',
               },
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Failed to fetch calendars: ${response.statusText} - ${errorText}`,
-                  },
-                ],
-                isError: true,
-              };
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, { operation: "list calendars" }));
             }
 
-            const data = await response.json() as CalendarListResponse;
+            const data = (res.bodyJson as CalendarListResponse) || { items: [] };
             const calendars = data.items || [];
 
             if (calendars.length === 0) {
-              const result = {
+              return okResult({
                 calendars: [],
                 nextPageToken: null,
                 message: "No calendars found"
-              };
-              return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-                structuredContent: result,
-              };
+              });
             }
 
-            const result = {
+            return okResult({
               calendars: calendars.map(cal => ({
                 id: cal.id,
                 summary: cal.summary,
@@ -301,16 +542,9 @@ export class GoogleCalendarTools {
                 primary: cal.primary || false
               })),
               nextPageToken: data.nextPageToken || null
-            };
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              structuredContent: result,
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({ error: String(error) }) }],
-              isError: true,
-            };
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in list_calendars: ${error?.message || String(error)}` });
           }
         })
       },
@@ -336,131 +570,70 @@ export class GoogleCalendarTools {
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, dateMin, timeMin, dateMax, timeMax, timeZone, pageToken }: any, context: any) => {
           try {
-            // The accessToken in context is the actual Google token for API calls
-            const googleToken = context?.accessToken;
-            if (!googleToken) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Provider access token not available",
-                  },
-                ],
-                isError: true,
-              };
-            }
-
-            // Encode calendar ID properly for URL
+            const googleToken = context.accessToken;
             const encodedCalendarId = encodeURIComponent(calendarId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
-            
-            // Set query parameters
+
             url.searchParams.set('maxResults', Math.min(maxResults, 2500).toString());
             url.searchParams.set('singleEvents', 'true');
             url.searchParams.set('orderBy', 'startTime');
-            
-            // Add pagination token if provided
             if (pageToken) url.searchParams.set('pageToken', pageToken);
-            
-            // Add timezone if specified
             if (timeZone) url.searchParams.set('timeZone', timeZone);
-            
-            // Helper to get timezone offset using Intl API
+
+            // Helper to get timezone offset using Intl API ("-08:00" / "+05:30" / "Z").
             const getOffset = (dateStr: string, timeStr: string, tz: string): string => {
               if (tz === 'UTC') return 'Z';
-              
               const dateTime = new Date(`${dateStr}T${timeStr}`);
               const formatter = new Intl.DateTimeFormat('en-US', {
                 timeZone: tz,
-                timeZoneName: 'longOffset'  // This gives us "GMT-08:00" format
+                timeZoneName: 'longOffset'
               });
-              
               const parts = formatter.formatToParts(dateTime);
               const offsetPart = parts.find(p => p.type === 'timeZoneName')?.value || '';
-              
-              // Convert "GMT-08:00" to "-08:00" or "GMT+05:30" to "+05:30"
               const offset = offsetPart.replace('GMT', '').trim();
-              
               return offset || 'Z';
             };
-            
-            // Process time bounds - both dateMin and timeMin are now required
-            // Add proper timezone offset for RFC3339 format
+
             const minOffset = getOffset(dateMin, timeMin, timeZone);
             const processedTimeMin = `${dateMin}T${timeMin}${minOffset}`;
-            
-            // Debug logging
-            console.log('Processing timeMin:', {
-              input: { dateMin, timeMin, timeZone },
-              offset: minOffset,
-              processed: processedTimeMin
-            });
-            
             url.searchParams.set('timeMin', processedTimeMin);
-            
+
             if (dateMax) {
               const maxTime = timeMax || '00:00:00';
               const maxOffset = getOffset(dateMax, maxTime, timeZone);
               const processedTimeMax = `${dateMax}T${maxTime}${maxOffset}`;
               url.searchParams.set('timeMax', processedTimeMax);
             } else if (timeMax) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "timeMax requires dateMax to be specified",
-                  },
-                ],
-                isError: true,
-              };
+              return errorResult({
+                error: "timeMax requires dateMax to be specified",
+                hint: "Pass both dateMax (YYYY-MM-DD) and optionally timeMax (HH:MM:SS), or pass neither."
+              });
             }
 
-            const response = await fetch(url.toString(), {
+            const res = await googleFetch(url.toString(), {
               headers: {
                 'Authorization': `Bearer ${googleToken}`,
                 'Accept': 'application/json',
               },
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              let errorMessage = `Failed to fetch events from calendar ID "${calendarId}": ${response.statusText}`;
-              
-              if (response.status === 404) {
-                errorMessage = `Calendar ID "${calendarId}" not found. Please verify the calendar ID using list_calendars or check access permissions.`;
-              } else if (response.status === 401) {
-                errorMessage = `Authentication failed. Please re-authenticate.`;
-              } else if (response.status === 403) {
-                errorMessage = `Access denied to calendar ID "${calendarId}". Please check permissions.`;
-              } else {
-                errorMessage += ` - ${errorText}`;
-              }
-              
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: errorMessage,
-                  },
-                ],
-                isError: true,
-              };
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "fetch calendar events",
+                resource: "calendar",
+                resourceId: calendarId,
+              }));
             }
 
-            const data = await response.json() as EventsListResponse;
+            const data = (res.bodyJson as EventsListResponse) || { items: [] };
             const events = data.items || [];
 
             if (events.length === 0) {
-              const result = {
+              return okResult({
                 calendarId,
                 events: [] as any[],
                 nextPageToken: null,
                 message: `No events found in calendar "${calendarId}"${dateMin || dateMax ? ' for the specified time range' : ''}`
-              };
-              return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-                structuredContent: result,
-              };
+              });
             }
 
             const structuredEvents = events.flatMap(event => {
@@ -487,20 +660,13 @@ export class GoogleCalendarTools {
               }
             });
 
-            const result = {
+            return okResult({
               calendarId,
               events: structuredEvents,
               nextPageToken: data.nextPageToken || null
-            };
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              structuredContent: result,
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({ error: String(error) }) }],
-              isError: true,
-            };
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in get_calendar_events: ${error?.message || String(error)}` });
           }
         })
       },
@@ -535,20 +701,8 @@ export class GoogleCalendarTools {
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
-            const googleToken = context?.accessToken;
-            if (!googleToken) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Provider access token not available",
-                  },
-                ],
-                isError: true,
-              };
-            }
-
-            const { 
+            const googleToken = context.accessToken;
+            const {
               calendarId, summary, description, location,
               startDate, startTime, endDate, endTime, timeZone, attendees, sendUpdates
             } = params;
@@ -559,51 +713,39 @@ export class GoogleCalendarTools {
               location,
             };
 
-            // Detect if it's an all-day event or timed event based on presence of time
             const isAllDay = !startTime && !endTime;
-            
+
             if (isAllDay) {
               event.start = { date: startDate };
               event.end = { date: endDate };
             } else {
-              // Validate that both times are provided for timed events
               if (!startTime || !endTime) {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: "For timed events, both startTime and endTime must be provided",
-                    },
-                  ],
-                  isError: true,
-                };
+                return errorResult({
+                  error: "For timed events, both startTime and endTime must be provided.",
+                  hint: "For all-day events, omit BOTH startTime and endTime. For timed events, provide BOTH."
+                });
               }
-              // For timed events, combine date and time
               const startDateTime = `${startDate}T${startTime}`;
               const endDateTime = `${endDate}T${endTime}`;
-              
-              event.start = { 
+              event.start = {
                 dateTime: startDateTime,
                 ...(timeZone && { timeZone })
               };
-              event.end = { 
+              event.end = {
                 dateTime: endDateTime,
                 ...(timeZone && { timeZone })
               };
             }
 
-            // Add attendees if specified
             if (attendees && attendees.length > 0) {
               event.attendees = attendees.map((email: string) => ({ email }));
             }
 
             const encodedCalendarId = encodeURIComponent(calendarId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
-            
-            // Add sendUpdates parameter
             url.searchParams.set('sendUpdates', sendUpdates);
 
-            const response = await fetch(url.toString(), {
+            const res = await googleFetch(url.toString(), {
               method: 'POST',
               headers: {
                 'Authorization': `Bearer ${googleToken}`,
@@ -612,48 +754,24 @@ export class GoogleCalendarTools {
               },
               body: JSON.stringify(event),
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              let errorMessage = `Failed to create event in calendar ID "${calendarId}": ${response.statusText}`;
-              
-              if (response.status === 404) {
-                errorMessage = `Calendar "${calendarId}" not found. Please verify the calendar ID using list_calendars.`;
-              } else if (response.status === 401) {
-                errorMessage = `Authentication failed. Please re-authenticate.`;
-              } else if (response.status === 403) {
-                errorMessage = `Access denied to calendar ID "${calendarId}". You may not have permission to create events in this calendar.`;
-              } else if (response.status === 400) {
-                // Parse the error to provide more specific guidance
-                try {
-                  const errorObj = JSON.parse(errorText);
-                  if (errorObj.error?.message?.includes('start') || errorObj.error?.message?.includes('end')) {
-                    errorMessage = `Invalid event times. Ensure start time is before end time and dates are valid.`;
-                  } else {
-                    errorMessage = `Invalid event data: ${errorObj.error?.message || errorText}`;
-                  }
-                } catch {
-                  errorMessage = `Invalid request: ${errorText}`;
-                }
-              } else {
-                errorMessage += ` - ${errorText}`;
-              }
-              
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: errorMessage,
-                  },
-                ],
-                isError: true,
-              };
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "create calendar event",
+                resource: "calendar",
+                resourceId: calendarId,
+              }));
             }
 
-            const createdEvent = await response.json() as CalendarEvent;
+            const createdEvent = (res.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+            if (!createdEvent.id) {
+              return errorResult({
+                error: "Google returned an unexpected response with no event id.",
+                bodyText: res.bodyText,
+              });
+            }
 
             const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(createdEvent.conferenceData);
-            const result = {
+            return okResult({
               id: createdEvent.id,
               summary: createdEvent.summary,
               start: this.formatDateTimeWithDay(createdEvent.start),
@@ -665,16 +783,9 @@ export class GoogleCalendarTools {
               ...(typeof createdEvent.hangoutLink === 'string' && { hangoutLink: createdEvent.hangoutLink }),
               ...(sanitizedConf && { conferenceData: sanitizedConf }),
               status: createdEvent.status,
-            };
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              structuredContent: result,
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({ error: String(error) }) }],
-              isError: true,
-            };
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in create_event: ${error?.message || String(error)}` });
           }
         })
       },
@@ -711,93 +822,56 @@ export class GoogleCalendarTools {
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
-            const googleToken = context?.accessToken;
-            if (!googleToken) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Provider access token not available",
-                  },
-                ],
-                isError: true,
-              };
-            }
-
-            const { 
+            const googleToken = context.accessToken;
+            const {
               calendarId, eventId, summary, description, location,
               startDate, startTime, endDate, endTime, timeZone, attendees, sendUpdates
             } = params;
 
             const updates: any = {};
-            
             if (summary !== undefined) updates.summary = summary;
             if (description !== undefined) updates.description = md.render(description);
             if (location !== undefined) updates.location = location;
-            
-            // Handle start/end time updates
+
             const hasDateFields = startDate !== undefined || endDate !== undefined;
             const hasTimeFields = startTime !== undefined || endTime !== undefined;
-            
+
             if (hasDateFields) {
-              // If any date field is provided, both dates must be provided
               if (!startDate || !endDate) {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: "When updating event dates, both startDate and endDate must be provided",
-                    },
-                  ],
-                  isError: true,
-                };
+                return errorResult({
+                  error: "When updating event dates, BOTH startDate and endDate must be provided.",
+                  hint: "To leave the date unchanged, omit both startDate and endDate."
+                });
               }
-              
-              // Check if it's an all-day event or timed event
               const isAllDay = !startTime && !endTime;
-              
               if (isAllDay) {
                 updates.start = { date: startDate };
                 updates.end = { date: endDate };
               } else {
-                // For timed events, both times must be provided
                 if (!startTime || !endTime) {
-                  return {
-                    content: [
-                      {
-                        type: "text",
-                        text: "For timed events, both startTime and endTime must be provided",
-                      },
-                    ],
-                    isError: true,
-                  };
+                  return errorResult({
+                    error: "For timed events, both startTime and endTime must be provided.",
+                    hint: "Provide BOTH startTime and endTime, or omit BOTH for an all-day event."
+                  });
                 }
-                
                 const startDateTime = `${startDate}T${startTime}`;
                 const endDateTime = `${endDate}T${endTime}`;
-                
-                updates.start = { 
+                updates.start = {
                   dateTime: startDateTime,
                   ...(timeZone && { timeZone })
                 };
-                updates.end = { 
+                updates.end = {
                   dateTime: endDateTime,
                   ...(timeZone && { timeZone })
                 };
               }
             } else if (hasTimeFields) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Time fields cannot be updated without date fields",
-                  },
-                ],
-                isError: true,
-              };
+              return errorResult({
+                error: "Time fields cannot be updated without date fields.",
+                hint: "Re-pass the event's existing date(s) along with the new startTime/endTime."
+              });
             }
-            
-            // Update attendees if specified
+
             if (attendees !== undefined) {
               updates.attendees = attendees.map((email: string) => ({ email }));
             }
@@ -805,12 +879,10 @@ export class GoogleCalendarTools {
             const encodedCalendarId = encodeURIComponent(calendarId);
             const encodedEventId = encodeURIComponent(eventId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events/${encodedEventId}`);
-            
-            // Add sendUpdates parameter
             url.searchParams.set('sendUpdates', sendUpdates);
 
-            const response = await fetch(url.toString(), {
-              method: 'PATCH',  // PATCH for partial updates
+            const res = await googleFetch(url.toString(), {
+              method: 'PATCH',
               headers: {
                 'Authorization': `Bearer ${googleToken}`,
                 'Content-Type': 'application/json',
@@ -818,58 +890,24 @@ export class GoogleCalendarTools {
               },
               body: JSON.stringify(updates),
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              let errorMessage = `Failed to update event ID "${eventId}" in calendar ID "${calendarId}": ${response.statusText}`;
-              
-              if (response.status === 404) {
-                // Could be either calendar or event not found
-                try {
-                  const errorObj = JSON.parse(errorText);
-                  if (errorObj.error?.message?.includes('event')) {
-                    errorMessage = `Event ID "${eventId}" not found in calendar ID "${calendarId}". Please verify the event ID using get_calendar_events.`;
-                  } else {
-                    errorMessage = `Calendar ID "${calendarId}" or event ID "${eventId}" not found. Please verify both IDs using list_calendars and get_calendar_events.`;
-                  }
-                } catch {
-                  errorMessage = `Calendar "${calendarId}" or event "${eventId}" not found. Please verify both IDs using list_calendars and get_calendar_events.`;
-                }
-              } else if (response.status === 401) {
-                errorMessage = `Authentication failed. Please re-authenticate.`;
-              } else if (response.status === 403) {
-                errorMessage = `Access denied. You may not have permission to update events in calendar ID "${calendarId}".`;
-              } else if (response.status === 400) {
-                // Parse the error to provide more specific guidance
-                try {
-                  const errorObj = JSON.parse(errorText);
-                  if (errorObj.error?.message?.includes('start') || errorObj.error?.message?.includes('end')) {
-                    errorMessage = `Invalid event times. Ensure start time is before end time and dates are valid.`;
-                  } else {
-                    errorMessage = `Invalid update data: ${errorObj.error?.message || errorText}`;
-                  }
-                } catch {
-                  errorMessage = `Invalid request: ${errorText}`;
-                }
-              } else {
-                errorMessage += ` - ${errorText}`;
-              }
-              
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: errorMessage,
-                  },
-                ],
-                isError: true,
-              };
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "update calendar event",
+                resource: "event",
+                resourceId: eventId,
+              }));
             }
 
-            const updatedEvent = await response.json() as CalendarEvent;
+            const updatedEvent = (res.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+            if (!updatedEvent.id) {
+              return errorResult({
+                error: "Google returned an unexpected response with no event id.",
+                bodyText: res.bodyText,
+              });
+            }
 
             const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(updatedEvent.conferenceData);
-            const result = {
+            return okResult({
               id: updatedEvent.id,
               summary: updatedEvent.summary,
               start: this.formatDateTimeWithDay(updatedEvent.start),
@@ -882,16 +920,9 @@ export class GoogleCalendarTools {
               ...(sanitizedConf && { conferenceData: sanitizedConf }),
               status: updatedEvent.status,
               updated: updatedEvent.updated,
-            };
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              structuredContent: result,
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({ error: String(error) }) }],
-              isError: true,
-            };
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in update_event: ${error?.message || String(error)}` });
           }
         })
       },
@@ -911,88 +942,36 @@ export class GoogleCalendarTools {
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
-            const googleToken = context?.accessToken;
-            if (!googleToken) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Provider access token not available",
-                  },
-                ],
-                isError: true,
-              };
-            }
-
+            const googleToken = context.accessToken;
             const { calendarId, eventId, sendUpdates } = params;
 
             const encodedCalendarId = encodeURIComponent(calendarId);
             const encodedEventId = encodeURIComponent(eventId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events/${encodedEventId}`);
-            
-            // Add sendUpdates parameter
             url.searchParams.set('sendUpdates', sendUpdates);
 
-            const response = await fetch(url.toString(), {
+            const res = await googleFetch(url.toString(), {
               method: 'DELETE',
               headers: {
                 'Authorization': `Bearer ${googleToken}`,
                 'Accept': 'application/json',
               },
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              let errorMessage = `Failed to delete event ID "${eventId}" from calendar ID "${calendarId}": ${response.statusText}`;
-              
-              if (response.status === 404) {
-                // Could be either calendar or event not found
-                try {
-                  const errorObj = JSON.parse(errorText);
-                  if (errorObj.error?.message?.includes('event')) {
-                    errorMessage = `Event ID "${eventId}" not found in calendar ID "${calendarId}". It may have been already deleted or the event ID is incorrect.`;
-                  } else {
-                    errorMessage = `Calendar ID "${calendarId}" or event ID "${eventId}" not found. Please verify both IDs using list_calendars and get_calendar_events.`;
-                  }
-                } catch {
-                  errorMessage = `Calendar "${calendarId}" or event "${eventId}" not found. Please verify both IDs using list_calendars and get_calendar_events.`;
-                }
-              } else if (response.status === 401) {
-                errorMessage = `Authentication failed. Please re-authenticate.`;
-              } else if (response.status === 403) {
-                errorMessage = `Access denied. You may not have permission to delete events from calendar ID "${calendarId}".`;
-              } else if (response.status === 410) {
-                errorMessage = `Event ID "${eventId}" has already been deleted.`;
-              } else {
-                errorMessage += ` - ${errorText}`;
-              }
-              
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: errorMessage,
-                  },
-                ],
-                isError: true,
-              };
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "delete calendar event",
+                resource: "event",
+                resourceId: eventId,
+              }));
             }
 
-            // DELETE returns 204 No Content on success
-            const result = {
+            return okResult({
               success: true,
-              eventId: eventId,
+              eventId,
               message: `Event ${eventId} successfully deleted from calendar ${calendarId}`,
-            };
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              structuredContent: result,
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({ error: String(error) }) }],
-              isError: true,
-            };
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in delete_event: ${error?.message || String(error)}` });
           }
         })
       },
@@ -1023,41 +1002,27 @@ export class GoogleCalendarTools {
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async (params: any, context: any) => {
           try {
-            const googleToken = context?.accessToken;
-            if (!googleToken) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Provider access token not available",
-                  },
-                ],
-                isError: true,
-              };
-            }
-
-            const { 
-              duration, 
-              timezone, 
+            const googleToken = context.accessToken;
+            const {
+              duration,
+              timezone,
               searchHoursStart,
               searchHoursEnd,
               includeDays,
               startFromDate,
-              startFromTime, 
-              startTimeIncrement, 
-              calendarId 
+              startFromTime,
+              startTimeIncrement,
+              calendarId
             } = params;
 
-            // Parse start time
             const startDateTime = `${startFromDate}T${startFromTime}`;
             const searchStart = new Date(startDateTime);
-            
+
             // We'll search up to 30 days ahead to find 10 available slots
             const maxSearchDays = 30;
             const searchEnd = new Date(searchStart);
             searchEnd.setDate(searchEnd.getDate() + maxSearchDays);
 
-            // Get busy times from Google Calendar
             const requestBody: any = {
               timeMin: searchStart.toISOString(),
               timeMax: searchEnd.toISOString(),
@@ -1066,8 +1031,7 @@ export class GoogleCalendarTools {
             };
 
             const url = 'https://www.googleapis.com/calendar/v3/freeBusy';
-
-            const response = await fetch(url, {
+            const res = await googleFetch(url, {
               method: 'POST',
               headers: {
                 'Authorization': `Bearer ${googleToken}`,
@@ -1076,84 +1040,40 @@ export class GoogleCalendarTools {
               },
               body: JSON.stringify(requestBody),
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              let errorMessage = `Failed to get availability for calendar ID "${calendarId}": ${response.statusText}`;
-              
-              if (response.status === 404) {
-                errorMessage = `Calendar "${calendarId}" not found. Please verify the calendar ID using list_calendars.`;
-              } else if (response.status === 401) {
-                errorMessage = `Authentication failed. Please re-authenticate.`;
-              } else if (response.status === 403) {
-                errorMessage = `Access denied to calendar ID "${calendarId}". You may not have permission to view free/busy information for this calendar.`;
-              } else if (response.status === 400) {
-                // Parse the error to provide more specific guidance
-                try {
-                  const errorObj = JSON.parse(errorText);
-                  if (errorObj.error?.message?.includes('timeMin') || errorObj.error?.message?.includes('timeMax')) {
-                    errorMessage = `Invalid time range. Ensure times are in valid format and timeMin is before timeMax.`;
-                  } else if (errorObj.error?.message?.includes('calendar')) {
-                    errorMessage = `Invalid calendar ID format: "${calendarId}". Please verify using list_calendars.`;
-                  } else {
-                    errorMessage = `Invalid request: ${errorObj.error?.message || errorText}`;
-                  }
-                } catch {
-                  errorMessage = `Invalid request: ${errorText}`;
-                }
-              } else {
-                errorMessage += ` - ${errorText}`;
-              }
-              
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: errorMessage,
-                  },
-                ],
-                isError: true,
-              };
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "query free/busy for calendar",
+                resource: "calendar",
+                resourceId: calendarId,
+              }));
             }
 
-            const data = await response.json() as FreeBusyResponse;
+            const data = (res.bodyJson as FreeBusyResponse) || ({ calendars: {} } as FreeBusyResponse);
 
-            // Check if the calendar ID was valid
             const calendarData = data.calendars?.[calendarId];
             if (!calendarData) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Calendar ID "${calendarId}" not found in response. Please verify the calendar ID using list_calendars.`,
-                  },
-                ],
-                isError: true,
-              };
+              return errorResult({
+                operation: "query free/busy for calendar",
+                resource: "calendar",
+                resourceId: calendarId,
+                error: `Calendar ID "${calendarId}" not present in free/busy response. Verify the ID via list_calendars.`,
+              });
             }
-            
-            // Check for errors in the calendar response
+
             if (calendarData.errors && calendarData.errors.length > 0) {
-              const error = calendarData.errors[0];
-              let errorMessage = `Calendar ID "${calendarId}" `;
-              
-              if (error.reason === 'notFound') {
-                errorMessage += 'not found. Please verify the calendar ID using list_calendars.';
-              } else if (error.reason === 'forbidden') {
-                errorMessage += 'access denied. You may not have permission to view free/busy information for this calendar.';
-              } else {
-                errorMessage += `error: ${error.reason || 'unknown error'}`;
-              }
-              
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: errorMessage,
-                  },
-                ],
-                isError: true,
-              };
+              const e = calendarData.errors[0];
+              return errorResult({
+                operation: "query free/busy for calendar",
+                resource: "calendar",
+                resourceId: calendarId,
+                googleReason: e.reason,
+                error:
+                  e.reason === 'notFound'
+                    ? `Calendar "${calendarId}" not found. Verify via list_calendars.`
+                    : e.reason === 'forbidden'
+                      ? `Access denied for calendar "${calendarId}". The authenticated user cannot read its free/busy info.`
+                      : `Free/busy lookup failed for calendar "${calendarId}": ${e.reason || 'unknown error'}.`,
+              });
             }
             
             // Collect all busy times from the calendar
@@ -1312,20 +1232,12 @@ export class GoogleCalendarTools {
               searchedUntil = currentTime;
             }
 
-            const result = {
+            return okResult({
               availableSlots,
               searchedUntil: toLocalISO(searchedUntil, timezone)
-            };
-
-            return {
-              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-              structuredContent: result,
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({ error: String(error) }) }],
-              isError: true,
-            };
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in get_next_availability: ${error?.message || String(error)}` });
           }
         })
       }
