@@ -1,6 +1,19 @@
 import { z } from "zod";
 import { withGoogleAuth as requirePermissionSecure } from "./auth.js";
 import MarkdownIt from 'markdown-it';
+import {
+  parseIso,
+  attachOffsetForTimezone,
+  getDayOfWeek,
+  formatDateTimeWithDay,
+  normalizeAttendees,
+  isWithinSearchHours,
+  alignToSlotBoundary,
+  advanceToNextSlot,
+  isSlotBusy,
+  toLocalISO,
+  type FormattedDateTime,
+} from "./lib/datetime.js";
 
 // `html: false` is intentional: descriptions come from LLM-generated text that
 // may inadvertently contain raw HTML/script tags. Disabling pass-through still
@@ -282,70 +295,6 @@ function okResult<T extends Record<string, unknown>>(structured: T) {
   };
 }
 
-// ISO 8601 patterns:
-//   - Date-only:        YYYY-MM-DD
-//   - Naive datetime:   YYYY-MM-DDTHH:MM[:SS][.fff]
-//   - Aware datetime:   YYYY-MM-DDTHH:MM[:SS][.fff](Z|±HH:MM)
-const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_DATETIME_AWARE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
-const ISO_DATETIME_NAIVE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?$/;
-
-type ParsedIso =
-  | { kind: "date"; date: string } // YYYY-MM-DD
-  | { kind: "datetime"; rfc3339: string; hasOffset: boolean };
-
-/**
- * Parse a user-supplied ISO 8601 string into a normalised form.
- * - "2024-01-15" → { kind: "date" }
- * - "2024-01-15T09:00:00Z" or with offset → { kind: "datetime", hasOffset: true }
- * - "2024-01-15T09:00:00" (naive) → { kind: "datetime", hasOffset: false } (needs a timeZone)
- * Returns null on invalid input.
- */
-function parseIso(input: string): ParsedIso | null {
-  if (typeof input !== "string") return null;
-  const s = input.trim();
-  if (ISO_DATE_ONLY_RE.test(s)) {
-    // Validate it's a real date
-    const d = new Date(`${s}T00:00:00Z`);
-    if (Number.isNaN(d.getTime())) return null;
-    return { kind: "date", date: s };
-  }
-  if (ISO_DATETIME_AWARE_RE.test(s)) {
-    const d = new Date(s);
-    if (Number.isNaN(d.getTime())) return null;
-    return { kind: "datetime", rfc3339: s, hasOffset: true };
-  }
-  if (ISO_DATETIME_NAIVE_RE.test(s)) {
-    // Don't construct a Date for naive forms (Date assumes local TZ, which is misleading).
-    return { kind: "datetime", rfc3339: s, hasOffset: false };
-  }
-  return null;
-}
-
-/**
- * Given a naive ISO datetime ("YYYY-MM-DDTHH:MM[:SS]") and an IANA timezone,
- * return an RFC3339 string with the correct offset for that wall-clock time.
- */
-function attachOffsetForTimezone(naiveIso: string, timeZone: string): string {
-  if (timeZone === "UTC") return `${naiveIso}Z`;
-  // Construct a Date in the local environment; we don't actually use its absolute
-  // value, just its components-by-formatter result. Format the same wall-clock
-  // moment in the target zone to obtain the offset string.
-  const probe = new Date(naiveIso);
-  if (Number.isNaN(probe.getTime())) {
-    // Fall back to no offset; let the caller decide.
-    return naiveIso;
-  }
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    timeZoneName: "longOffset",
-  });
-  const offsetPart =
-    formatter.formatToParts(probe).find((p) => p.type === "timeZoneName")?.value || "";
-  const offset = offsetPart.replace("GMT", "").trim();
-  return `${naiveIso}${offset || "Z"}`;
-}
-
 interface ConferenceEntryPoint {
   entryPointType: string;
   uri: string;
@@ -393,13 +342,6 @@ interface CalendarEvent {
   updated?: string;
 }
 
-interface FormattedDateTime {
-  date: string;
-  time?: string;
-  dayOfWeek: string;
-  timezone?: string;
-}
-
 interface Calendar {
   id: string;
   summary: string;
@@ -440,19 +382,6 @@ const attendeeInputSchema = z.union([
     optional: z.boolean().optional(),
   }),
 ]);
-
-function normalizeAttendees(
-  input: Array<string | { email: string; displayName?: string; optional?: boolean }> | undefined
-): Array<{ email: string; displayName?: string; optional?: boolean }> | undefined {
-  if (!input) return undefined;
-  return input.map((a) => {
-    if (typeof a === 'string') return { email: a };
-    const out: { email: string; displayName?: string; optional?: boolean } = { email: a.email };
-    if (typeof a.displayName === 'string' && a.displayName.length > 0) out.displayName = a.displayName;
-    if (a.optional === true) out.optional = true;
-    return out;
-  });
-}
 
 // Reusable output schema fragments.
 // All schemas use .passthrough() + inner-optional fields so undocumented
@@ -509,18 +438,6 @@ const eventSchema = z.object({
 }).passthrough();
 
 export class GoogleCalendarTools {
-  private static getDayOfWeek(dateStr: string): string {
-    // Use the wall-clock date portion (YYYY-MM-DD) rather than absolute time,
-    // so events report the day they appear on in the user's calendar regardless
-    // of server timezone. Anchor at UTC noon to dodge DST/edge issues.
-    const tIdx = dateStr.indexOf('T');
-    const datePart = tIdx >= 0 ? dateStr.slice(0, tIdx) : dateStr;
-    const date = new Date(`${datePart}T12:00:00Z`);
-    if (Number.isNaN(date.getTime())) return '';
-    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    return days[date.getUTCDay()];
-  }
-
   private static sanitizeConferenceData(cd?: CalendarEvent['conferenceData']): ConferenceData | undefined {
     if (!cd) return undefined;
     const sanitized: ConferenceData = {};
@@ -542,56 +459,6 @@ export class GoogleCalendarTools {
     }
     if (typeof cd.conferenceId === 'string') sanitized.conferenceId = cd.conferenceId;
     return Object.keys(sanitized).length > 0 ? sanitized : undefined;
-  }
-
-  private static formatDateTimeWithDay(eventDateTime: { dateTime?: string; date?: string }): FormattedDateTime {
-    if (eventDateTime.dateTime) {
-      // Preserve the wall-clock date/time from the original ISO string so that
-      // a zone-aware datetime like "2024-01-15T23:00:00-08:00" reports
-      // date="2024-01-15" + time="23:00:00", not the UTC-shifted date.
-      const raw = eventDateTime.dateTime;
-      const tIdx = raw.indexOf('T');
-      const datePart = tIdx >= 0 ? raw.slice(0, tIdx) : raw;
-      const timePart = tIdx >= 0 ? raw.slice(tIdx + 1) : '';
-
-      let time = '';
-      let timezone = '';
-      if (timePart) {
-        if (timePart.endsWith('Z')) {
-          time = timePart.slice(0, -1);
-          timezone = 'Z';
-        } else {
-          // Look for an offset suffix at position >= "HH:MM" length (5).
-          // This avoids confusing a '-' inside the date with an offset sign.
-          const offsetMatch = timePart.match(/([+-]\d{2}:\d{2})$/);
-          if (offsetMatch) {
-            timezone = offsetMatch[1];
-            time = timePart.slice(0, -timezone.length);
-          } else {
-            time = timePart;
-          }
-        }
-      }
-
-      return {
-        date: datePart,
-        time,
-        dayOfWeek: this.getDayOfWeek(raw),
-        timezone,
-      };
-    } else if (eventDateTime.date) {
-      // All-day event, only has date
-      return {
-        date: eventDateTime.date,
-        dayOfWeek: this.getDayOfWeek(eventDateTime.date)
-      };
-    }
-
-    // Fallback (shouldn't happen)
-    return {
-      date: '',
-      dayOfWeek: ''
-    };
   }
 
   static getTools() {
@@ -782,8 +649,8 @@ export class GoogleCalendarTools {
                 return [{
                   id: event.id,
                   summary: event.summary || 'Untitled Event',
-                  start: this.formatDateTimeWithDay(event.start),
-                  end: this.formatDateTimeWithDay(event.end),
+                  start: formatDateTimeWithDay(event.start),
+                  end: formatDateTimeWithDay(event.end),
                   location: event.location || null,
                   description: event.description || null,
                   attendees: event.attendees
@@ -944,8 +811,8 @@ export class GoogleCalendarTools {
             return okResult({
               id: createdEvent.id,
               summary: createdEvent.summary,
-              start: this.formatDateTimeWithDay(createdEvent.start),
-              end: this.formatDateTimeWithDay(createdEvent.end),
+              start: formatDateTimeWithDay(createdEvent.start),
+              end: formatDateTimeWithDay(createdEvent.end),
               location: createdEvent.location,
               description: createdEvent.description,
               attendees: createdEvent.attendees,
@@ -1108,8 +975,8 @@ export class GoogleCalendarTools {
             return okResult({
               id: updatedEvent.id,
               summary: updatedEvent.summary,
-              start: this.formatDateTimeWithDay(updatedEvent.start),
-              end: this.formatDateTimeWithDay(updatedEvent.end),
+              start: formatDateTimeWithDay(updatedEvent.start),
+              end: formatDateTimeWithDay(updatedEvent.end),
               location: updatedEvent.location,
               description: updatedEvent.description,
               attendees: updatedEvent.attendees,
@@ -1362,145 +1229,56 @@ export class GoogleCalendarTools {
             const availableSlots: Array<{ start: FormattedDateTime; end: FormattedDateTime }> = [];
             let currentTime = new Date(searchStart);
 
-            // Helper function to check if a time is within search hours.
-            // `boundary` indicates whether `date` is a slot-start (strict upper bound)
-            // or a slot-end (inclusive upper bound — a meeting ending exactly at
-            // `searchHoursEnd` is allowed).
-            const isWithinSearchHours = (
-              date: Date,
-              tz: string,
-              boundary: 'start' | 'end',
-            ): boolean => {
-              // Always resolve the wall-clock weekday/time in the target zone so the
-              // includeDays filter is applied even when no hour window is set.
-              const formatter = new Intl.DateTimeFormat('en-US', {
-                timeZone: tz,
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                hour12: false,
-                weekday: 'short'
-              });
-
-              const parts = formatter.formatToParts(date);
-              const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
-              const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
-              const second = parseInt(parts.find(p => p.type === 'second')?.value || '0');
-              const weekday = parts.find(p => p.type === 'weekday')?.value;
-
-              // Check if this day is included
-              if (includeDays && weekday && !includeDays.includes(weekday)) return false;
-
-              // If no hour window is set, weekday gating is the only constraint.
-              if (!searchHoursStart && !searchHoursEnd) return true;
-
-              const currentTimeInSeconds = hour * 3600 + minute * 60 + second;
-
-              const parseHms = (s: string): number => {
-                const [h = 0, m = 0, sec = 0] = s.split(':').map((v) => {
-                  const n = Number(v);
-                  return Number.isFinite(n) ? n : 0;
-                });
-                return h * 3600 + m * 60 + sec;
-              };
-
-              let startSeconds = 0;
-              let endSeconds = 24 * 3600; // Default to end of day
-              if (searchHoursStart) startSeconds = parseHms(searchHoursStart);
-              if (searchHoursEnd) endSeconds = parseHms(searchHoursEnd);
-
-              // Slot-start must be strictly before the window end; slot-end may
-              // equal the window end (a 16:00-17:00 meeting fits a "until 17:00" window).
-              if (currentTimeInSeconds < startSeconds) return false;
-              return boundary === 'end'
-                ? currentTimeInSeconds <= endSeconds
-                : currentTimeInSeconds < endSeconds;
-            };
-
-            // Helper function to advance to next slot
-            const advanceToNextSlot = (date: Date): Date => {
-              const next = new Date(date);
-              next.setMinutes(next.getMinutes() + startTimeIncrement);
-              return next;
-            };
-
-            // Helper function to check if a time range overlaps with any busy period
-            const isSlotBusy = (slotStart: Date, slotEnd: Date): boolean => {
-              for (const busy of busyTimes) {
-                // Check if slot overlaps with busy period
-                if (slotStart < busy.end && slotEnd > busy.start) {
-                  return true;
-                }
-              }
-              return false;
-            };
-
-            // Helper function to format date as local ISO 8601 string
-            const toLocalISO = (date: Date, tz: string): string => {
-              // Get the date/time components in the target timezone
-              const formatter = new Intl.DateTimeFormat('en-US', {
-                timeZone: tz,
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                hour12: false
-              });
-              
-              const parts = formatter.formatToParts(date);
-              const getValue = (type: string) => parts.find(p => p.type === type)?.value || '00';
-              
-              // Build ISO string without timezone indicator
-              return `${getValue('year')}-${getValue('month')}-${getValue('day')}T${getValue('hour')}:${getValue('minute')}:${getValue('second')}`;
-            };
-
-            // Search for available slots
+            // Search for available slots using the pure helpers in src/lib/datetime.ts.
             while (availableSlots.length < maxResults && currentTime < searchEnd) {
               // Align to next slot boundary
-              const minutes = currentTime.getMinutes();
-              const remainder = minutes % startTimeIncrement;
-              if (remainder !== 0) {
-                currentTime.setMinutes(minutes + (startTimeIncrement - remainder));
-                currentTime.setSeconds(0);
-                currentTime.setMilliseconds(0);
-              }
+              currentTime = alignToSlotBoundary(currentTime, startTimeIncrement);
 
               const slotStart = new Date(currentTime);
               const slotEnd = new Date(slotStart);
               slotEnd.setMinutes(slotEnd.getMinutes() + duration);
 
-              // Check if slot is within search hours
-              if (isWithinSearchHours(slotStart, timezone, 'start') && isWithinSearchHours(slotEnd, timezone, 'end')) {
-                // Check if slot is available (not busy)
-                if (!isSlotBusy(slotStart, slotEnd)) {
+              const startInWindow = isWithinSearchHours(slotStart, {
+                timeZone: timezone,
+                includeDays,
+                searchHoursStart,
+                searchHoursEnd,
+                boundary: 'start',
+              });
+              const endInWindow = isWithinSearchHours(slotEnd, {
+                timeZone: timezone,
+                includeDays,
+                searchHoursStart,
+                searchHoursEnd,
+                boundary: 'end',
+              });
+              if (startInWindow && endInWindow) {
+                if (!isSlotBusy(slotStart, slotEnd, busyTimes)) {
                   const startISO = toLocalISO(slotStart, timezone);
                   const endISO = toLocalISO(slotEnd, timezone);
-                  
-                  // Parse the ISO strings to extract date and time
+
                   const startDate = startISO.split('T')[0];
                   const startTime = startISO.split('T')[1];
                   const endDate = endISO.split('T')[0];
                   const endTime = endISO.split('T')[1];
-                  
+
                   availableSlots.push({
                     start: {
                       date: startDate,
                       time: startTime,
-                      dayOfWeek: this.getDayOfWeek(startISO)
+                      dayOfWeek: getDayOfWeek(startISO)
                     },
                     end: {
                       date: endDate,
                       time: endTime,
-                      dayOfWeek: this.getDayOfWeek(endISO)
+                      dayOfWeek: getDayOfWeek(endISO)
                     }
                   });
                 }
               }
 
               // Move to next slot
-              currentTime = advanceToNextSlot(currentTime);
+              currentTime = advanceToNextSlot(currentTime, startTimeIncrement);
             }
 
             // searchedUntil = the next position the search WOULD consider next.
