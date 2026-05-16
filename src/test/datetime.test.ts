@@ -110,6 +110,12 @@ describe("attachOffsetForTimezone", () => {
       /cannot parse naive ISO/,
     );
   });
+
+  it("throws on unparseable naive ISO even when timeZone is UTC", () => {
+    expect(() => attachOffsetForTimezone("not-a-date", "UTC")).toThrow(
+      /cannot parse naive ISO/,
+    );
+  });
 });
 
 describe("normalizeAttendees", () => {

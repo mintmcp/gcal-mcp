@@ -78,11 +78,11 @@ export function getOffset(timeZone: string, atInstant?: Date): string {
  * return an RFC3339 string with the correct offset for that wall-clock time.
  */
 export function attachOffsetForTimezone(naiveIso: string, timeZone: string): string {
-  if (timeZone === "UTC") return `${naiveIso}Z`;
   const probe = new Date(naiveIso);
   if (Number.isNaN(probe.getTime())) {
     throw new Error(`attachOffsetForTimezone: cannot parse naive ISO "${naiveIso}"`);
   }
+  if (timeZone === "UTC") return `${naiveIso}Z`;
   const offset = getOffset(timeZone, probe);
   return `${naiveIso}${offset}`;
 }
