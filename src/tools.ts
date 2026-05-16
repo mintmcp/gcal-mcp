@@ -1087,10 +1087,12 @@ export class GoogleCalendarTools {
             .describe('Start searching from this ISO 8601 instant. Date-only ("YYYY-MM-DD") starts at 00:00:00 in `timezone`. Datetime forms work too. Defaults to NOW.'),
           searchHoursStart: z
             .string()
+            .regex(/^([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/, 'searchHoursStart must be HH:MM or HH:MM:SS in 24-hour format')
             .optional()
             .describe('Daily window start as HH:MM[:SS] in `timezone` (e.g. "09:00"). If omitted, all hours are considered.'),
           searchHoursEnd: z
             .string()
+            .regex(/^([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/, 'searchHoursEnd must be HH:MM or HH:MM:SS in 24-hour format')
             .optional()
             .describe('Daily window end as HH:MM[:SS] in `timezone` (e.g. "17:00"). If omitted, all hours are considered.'),
           includeDays: z

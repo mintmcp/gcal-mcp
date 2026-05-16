@@ -104,6 +104,12 @@ describe("attachOffsetForTimezone", () => {
       "2024-06-15T12:00:00+01:00",
     );
   });
+
+  it("throws on unparseable naive ISO instead of silently passing through", () => {
+    expect(() => attachOffsetForTimezone("not-a-date", "America/Los_Angeles")).toThrow(
+      /cannot parse naive ISO/,
+    );
+  });
 });
 
 describe("normalizeAttendees", () => {
@@ -214,6 +220,18 @@ describe("isWithinSearchHours", () => {
       }),
     ).toBe(true);
   });
+
+  it("throws on malformed searchHours value instead of silently coercing", () => {
+    const monMorning = new Date("2024-01-15T09:00:00Z"); // Mon UTC
+    expect(() =>
+      isWithinSearchHours(monMorning, {
+        timeZone: "UTC",
+        searchHoursStart: "9am",
+        searchHoursEnd: "17:00",
+        boundary: "start",
+      }),
+    ).toThrow(/HH:MM\[:SS\]/);
+  });
 });
 
 describe("alignToSlotBoundary", () => {
@@ -252,6 +270,13 @@ describe("alignToSlotBoundary", () => {
     const beforeMs = t.getTime();
     alignToSlotBoundary(t, 30);
     expect(t.getTime()).toBe(beforeMs);
+  });
+
+  it("throws on non-positive incrementMinutes instead of producing NaN", () => {
+    const t = new Date("2024-01-15T10:00:00Z");
+    expect(() => alignToSlotBoundary(t, 0)).toThrow(/positive integer/);
+    expect(() => alignToSlotBoundary(t, -15)).toThrow(/positive integer/);
+    expect(() => alignToSlotBoundary(t, 1.5)).toThrow(/positive integer/);
   });
 });
 

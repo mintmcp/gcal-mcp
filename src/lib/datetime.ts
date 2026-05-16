@@ -81,7 +81,7 @@ export function attachOffsetForTimezone(naiveIso: string, timeZone: string): str
   if (timeZone === "UTC") return `${naiveIso}Z`;
   const probe = new Date(naiveIso);
   if (Number.isNaN(probe.getTime())) {
-    return naiveIso;
+    throw new Error(`attachOffsetForTimezone: cannot parse naive ISO "${naiveIso}"`);
   }
   const offset = getOffset(timeZone, probe);
   return `${naiveIso}${offset}`;
@@ -223,10 +223,10 @@ export function isWithinSearchHours(date: Date, opts: SearchHoursOpts): boolean 
   const currentTimeInSeconds = hour * 3600 + minute * 60 + second;
 
   const parseHms = (s: string): number => {
-    const [h = 0, m = 0, sec = 0] = s.split(":").map((v) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : 0;
-    });
+    if (!/^([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(s)) {
+      throw new Error(`parseHms: expected HH:MM[:SS] in 24-hour format, got "${s}"`);
+    }
+    const [h, m, sec = 0] = s.split(":").map((v) => Number(v));
     return h * 3600 + m * 60 + sec;
   };
 
@@ -252,6 +252,9 @@ export function isWithinSearchHours(date: Date, opts: SearchHoursOpts): boolean 
  * report slots whose times match the requested increment exactly.
  */
 export function alignToSlotBoundary(date: Date, incrementMinutes: number): Date {
+  if (!Number.isInteger(incrementMinutes) || incrementMinutes <= 0) {
+    throw new Error(`alignToSlotBoundary: incrementMinutes must be a positive integer, got ${incrementMinutes}`);
+  }
   const out = new Date(date);
   const minutes = out.getMinutes();
   const remainder = minutes % incrementMinutes;
