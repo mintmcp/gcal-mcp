@@ -235,6 +235,24 @@ describe("alignToSlotBoundary", () => {
     const out = alignToSlotBoundary(t, 15);
     expect(out.getUTCMinutes()).toBe(15);
   });
+
+  it("zeroes seconds/ms even when the minute is already on-grid", () => {
+    // Regression: a now-time of 10:30:17.123 used to stay off-grid because
+    // remainder=0 short-circuited the seconds/ms reset.
+    const t = new Date("2024-01-15T10:30:17.123Z");
+    const out = alignToSlotBoundary(t, 30);
+    expect(out.getUTCHours()).toBe(10);
+    expect(out.getUTCMinutes()).toBe(30);
+    expect(out.getUTCSeconds()).toBe(0);
+    expect(out.getUTCMilliseconds()).toBe(0);
+  });
+
+  it("does not mutate the input", () => {
+    const t = new Date("2024-01-15T10:07:42Z");
+    const beforeMs = t.getTime();
+    alignToSlotBoundary(t, 30);
+    expect(t.getTime()).toBe(beforeMs);
+  });
 });
 
 describe("advanceToNextSlot", () => {

@@ -242,9 +242,14 @@ export function isWithinSearchHours(date: Date, opts: SearchHoursOpts): boolean 
 }
 
 /**
- * Round `date` up to the next multiple of `incrementMinutes` past the hour.
- * Returns a new Date; does not mutate the input. If already aligned, returns
- * an equal copy.
+ * Round `date` up to the next multiple of `incrementMinutes` past the hour,
+ * always zeroing seconds and milliseconds. Returns a new Date; does not
+ * mutate the input.
+ *
+ * Note: zeroing seconds/ms is unconditional so that a non-aligned-by-seconds
+ * input (e.g. 10:30:17.123 on a 30-min grid) snaps to 10:30:00, not stays
+ * off-grid. Slot iteration in `get_next_availability` relies on this to
+ * report slots whose times match the requested increment exactly.
  */
 export function alignToSlotBoundary(date: Date, incrementMinutes: number): Date {
   const out = new Date(date);
@@ -252,9 +257,9 @@ export function alignToSlotBoundary(date: Date, incrementMinutes: number): Date 
   const remainder = minutes % incrementMinutes;
   if (remainder !== 0) {
     out.setMinutes(minutes + (incrementMinutes - remainder));
-    out.setSeconds(0);
-    out.setMilliseconds(0);
   }
+  out.setSeconds(0);
+  out.setMilliseconds(0);
   return out;
 }
 
