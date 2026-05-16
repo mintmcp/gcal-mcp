@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test for the gcal-mcp Docker image.
-# Builds the image, boots it on a random host port, and asserts that:
+# Builds the image, boots it on a Docker-assigned ephemeral host port, and
+# asserts that:
 #   - /healthz returns 200 with {"status":"ok"}
 #   - POST /mcp `initialize` returns a protocolVersion
 #   - POST /mcp `tools/list` lists exactly 6 tools
@@ -14,12 +15,6 @@ set -euo pipefail
 
 IMAGE_TAG="gcal-mcp:smoke"
 CONTAINER_NAME="gcal-mcp-smoke-$$"
-
-# Pick a random ephemeral host port. awk + srand seeded with $$ gives us a
-# portable PRNG without depending on shuf/jot/python.
-HOST_PORT=$(awk -v seed="$$" 'BEGIN{srand(seed); print int(49152 + rand() * 16383)}')
-
-BASE_URL="http://127.0.0.1:${HOST_PORT}"
 
 red()    { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 green()  { printf '\033[32m%s\033[0m\n' "$1"; }
@@ -40,12 +35,25 @@ trap cleanup EXIT
 step "Building image ${IMAGE_TAG}"
 docker build -t "${IMAGE_TAG}" .
 
-step "Starting container ${CONTAINER_NAME} on port ${HOST_PORT}"
+step "Starting container ${CONTAINER_NAME} (Docker-assigned loopback port)"
+# Bind only to 127.0.0.1 and let Docker pick a free ephemeral port — avoids
+# host-port races and never exposes the test server to the network.
 docker run --rm -d \
   --name "${CONTAINER_NAME}" \
-  -p "${HOST_PORT}:8000" \
+  -p "127.0.0.1::8000" \
   -e PORT=8000 \
   "${IMAGE_TAG}" >/dev/null
+
+# Resolve the assigned host port. `docker port` output looks like:
+#   8000/tcp -> 127.0.0.1:55321
+HOST_PORT=$(docker port "${CONTAINER_NAME}" 8000/tcp | head -n 1 | awk -F: '{print $NF}')
+if [ -z "${HOST_PORT}" ]; then
+  red "could not resolve host port for container ${CONTAINER_NAME}"
+  docker logs "${CONTAINER_NAME}" >&2 || true
+  exit 1
+fi
+BASE_URL="http://127.0.0.1:${HOST_PORT}"
+echo "container reachable at ${BASE_URL}"
 
 # Wait up to 30s for /healthz to come up.
 step "Waiting for /healthz"
@@ -69,56 +77,95 @@ if [ "${HEALTH_BODY}" != '{"status":"ok"}' ]; then
 fi
 green "/healthz OK"
 
-post_mcp() {
-  # $1 = json body to POST. Echoes the parsed response (jsonrpc envelope) on
-  # stdout. StreamableHTTPServerTransport may answer with text/event-stream
-  # frames; extract the JSON from any 'data: ...' line, or pass plain JSON
-  # through.
+# Tolerant POST: captures both HTTP status and body separately, so we can
+# inspect non-2xx responses instead of silently failing. Echoes "<status>|<body>".
+# The body is the parsed jsonrpc envelope (handling SSE 'data:' frames).
+post_mcp_tolerant() {
   local body="$1"
-  curl -fsS -X POST "${BASE_URL}/mcp" \
+  local out
+  out=$(mktemp)
+  local http_code
+  http_code=$(curl -sS -o "${out}" -w '%{http_code}' \
+    -X POST "${BASE_URL}/mcp" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "Authorization: Bearer fake-token" \
-    -d "${body}" \
-    | python3 -c '
-import sys, json
+    -d "${body}")
+  local raw
+  raw=$(cat "${out}")
+  rm -f "${out}"
+  # Extract JSON from SSE if needed.
+  local payload
+  payload=$(printf '%s' "${raw}" | python3 -c '
+import sys
 raw = sys.stdin.read()
-candidate = raw
 for line in raw.splitlines():
     if line.startswith("data:"):
-        candidate = line[5:].strip()
-        break
-parsed = json.loads(candidate)
-print(json.dumps(parsed))
-'
+        print(line[5:].strip())
+        sys.exit(0)
+print(raw)
+')
+  printf '%s|%s' "${http_code}" "${payload}"
+}
+
+parse_envelope() {
+  # Validate that the payload is JSON. Echo it back; non-JSON → empty.
+  python3 -c '
+import sys, json
+try:
+    json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+' >/dev/null 2>&1 <<<"$1" && printf '%s' "$1"
 }
 
 step "POST /mcp initialize"
-INIT_RESP=$(post_mcp '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}')
-PROTO=$(printf '%s' "${INIT_RESP}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("result",{}).get("protocolVersion",""))')
+RESP=$(post_mcp_tolerant '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}')
+STATUS="${RESP%%|*}"
+PAYLOAD="${RESP#*|}"
+if [ "${STATUS}" != "200" ]; then
+  red "initialize returned HTTP ${STATUS}: ${PAYLOAD}"
+  exit 1
+fi
+PROTO=$(printf '%s' "${PAYLOAD}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("result",{}).get("protocolVersion",""))' 2>/dev/null || true)
 if [ -z "${PROTO}" ]; then
-  red "initialize did not return protocolVersion: ${INIT_RESP}"
+  red "initialize did not return protocolVersion: ${PAYLOAD}"
   exit 1
 fi
 green "initialize OK (protocolVersion=${PROTO})"
 
 step "POST /mcp tools/list"
-TOOLS_RESP=$(post_mcp '{"jsonrpc":"2.0","method":"tools/list","id":2,"params":{}}')
-TOOL_COUNT=$(printf '%s' "${TOOLS_RESP}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(len(d.get("result",{}).get("tools",[])))')
+RESP=$(post_mcp_tolerant '{"jsonrpc":"2.0","method":"tools/list","id":2,"params":{}}')
+STATUS="${RESP%%|*}"
+PAYLOAD="${RESP#*|}"
+if [ "${STATUS}" != "200" ]; then
+  red "tools/list returned HTTP ${STATUS}: ${PAYLOAD}"
+  exit 1
+fi
+TOOL_COUNT=$(printf '%s' "${PAYLOAD}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(len(d.get("result",{}).get("tools",[])))' 2>/dev/null || echo 0)
 if [ "${TOOL_COUNT}" != "6" ]; then
-  red "expected 6 tools, got ${TOOL_COUNT}. Response: ${TOOLS_RESP}"
+  red "expected 6 tools, got ${TOOL_COUNT}. Response: ${PAYLOAD}"
   exit 1
 fi
 green "tools/list OK (6 tools)"
 
 step "POST /mcp tools/call list_calendars (fake token)"
-CALL_RESP=$(post_mcp '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_calendars","arguments":{}}}')
-# We accept either:
-#  - jsonrpc.error (transport-level rejection)
-#  - jsonrpc.result.isError === true (tool returned a structured error)
-# What we REJECT is a 5xx crash (already caught by curl -f), an empty body,
-# or a result that succeeded silently.
-IS_STRUCTURED_ERROR=$(printf '%s' "${CALL_RESP}" | python3 -c '
+RESP=$(post_mcp_tolerant '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_calendars","arguments":{}}}')
+STATUS="${RESP%%|*}"
+PAYLOAD="${RESP#*|}"
+# Accept any well-formed, non-5xx response. The contract under test is:
+# "tools/call with a fake bearer token must not crash the server (5xx)".
+# Both a jsonrpc.error envelope and result.isError=true count as success.
+if [ "${STATUS}" -ge 500 ]; then
+  red "tools/call returned HTTP ${STATUS} (crash): ${PAYLOAD}"
+  exit 1
+fi
+VALIDATED=$(parse_envelope "${PAYLOAD}" || true)
+if [ -z "${VALIDATED}" ]; then
+  red "tools/call returned non-JSON body (HTTP ${STATUS}): ${PAYLOAD}"
+  exit 1
+fi
+IS_STRUCTURED_ERROR=$(printf '%s' "${VALIDATED}" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 if "error" in d:
@@ -129,10 +176,10 @@ else:
     print("no")
 ')
 if [ "${IS_STRUCTURED_ERROR}" != "yes" ]; then
-  red "tools/call with fake token did not return a structured error: ${CALL_RESP}"
+  red "tools/call with fake token did not return a structured error (HTTP ${STATUS}): ${VALIDATED}"
   exit 1
 fi
-green "tools/call surfaced a structured error (no crash)"
+green "tools/call surfaced a structured error (HTTP ${STATUS}, no crash)"
 
 step "Assert container is still running"
 if ! docker ps --filter "name=^/${CONTAINER_NAME}$" --filter "status=running" -q | grep -q .; then
