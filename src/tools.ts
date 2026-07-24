@@ -310,6 +310,19 @@ interface ConferenceData {
   conferenceId?: string;
 }
 
+interface EventAttendee {
+  email: string;
+  responseStatus?: string;
+  self?: boolean;
+  organizer?: boolean;
+  displayName?: string;
+  optional?: boolean;
+  resource?: boolean;
+  comment?: string;
+  additionalGuests?: number;
+  [key: string]: unknown;
+}
+
 interface CalendarEvent {
   id: string;
   summary: string;
@@ -323,10 +336,7 @@ interface CalendarEvent {
   };
   description?: string;
   location?: string;
-  attendees?: Array<{
-    email: string;
-    responseStatus?: string;
-  }>;
+  attendees?: EventAttendee[];
   htmlLink?: string;
   hangoutLink?: string;
   conferenceData?: ConferenceData & {
@@ -833,7 +843,7 @@ export class GoogleCalendarTools {
           "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
           "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
           "`description` is rendered through Markdown to HTML by the server. " +
-          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. " +
+          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead — it preserves everyone else's responses. " +
           "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
         outputSchema: {
           id: z.string(),
@@ -988,6 +998,150 @@ export class GoogleCalendarTools {
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in update_event: ${error?.message || String(error)}` });
+          }
+        })
+      },
+
+      respond_to_event: {
+        description:
+          "RSVP to a Google Calendar event as the authenticated user ONLY (accept, decline, or tentatively accept). " +
+          "Use this — NOT update_event — to set your own response: update_event replaces the whole attendee list and resets everyone's responseStatus to needsAction, whereas this tool reads the event, changes ONLY your own attendee entry (identified via Google's `self` flag), and echoes back every other attendee untouched so their responses are preserved. " +
+          "Use calendarId='primary' (the default) — self-detection and RSVP propagation happen on your own copy of the event. " +
+          "Optionally attach a `comment` for the organizer. `sendUpdates` controls whether your response notifies others. " +
+          "Returns the event with your updated response {id, summary, myResponseStatus, attendees, ...}.",
+        outputSchema: {
+          id: z.string(),
+          summary: z.string(),
+          start: formattedDateTimeSchema,
+          end: formattedDateTimeSchema,
+          myResponseStatus: z.string(),
+          attendees: z.array(attendeeSchema).optional(),
+          htmlLink: z.string().optional(),
+          conferenceData: conferenceDataSchema.optional(),
+          status: z.string().optional(),
+          updated: z.string().optional(),
+          message: z.string(),
+        },
+        schema: {
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar the event lives on. Defaults to "primary" (your own calendar), which is required for self-detection.'),
+          eventId: z.string().describe('Event ID to respond to (from get_calendar_events).'),
+          responseStatus: z
+            .enum(['accepted', 'declined', 'tentative'])
+            .describe('Your RSVP: accepted, declined, or tentative.'),
+          comment: z.string().optional().describe('Optional response comment shown to the organizer.'),
+          sendUpdates: z
+            .enum(['all', 'externalOnly', 'none'])
+            .optional()
+            .default('all')
+            .describe('Whether to notify others of your response. all / externalOnly / none.'),
+        },
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
+          try {
+            const googleToken = context.accessToken;
+            const { calendarId, eventId, responseStatus, comment, sendUpdates } = params;
+
+            const encodedCalendarId = encodeURIComponent(calendarId);
+            const encodedEventId = encodeURIComponent(eventId);
+            const eventUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events/${encodedEventId}`;
+
+            const getRes = await googleFetch(eventUrl, {
+              headers: {
+                'Authorization': `Bearer ${googleToken}`,
+                'Accept': 'application/json',
+              },
+            });
+            if (!getRes.ok) {
+              return errorResult(mapGoogleError(getRes, {
+                operation: "load event to respond to",
+                resource: "event",
+                resourceId: eventId,
+              }));
+            }
+
+            const event = (getRes.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+            const attendees = event.attendees || [];
+
+            // Google flags the caller's own attendee entry with self:true when the
+            // event is read from a calendar they own (e.g. 'primary').
+            const selfIndex = attendees.findIndex(a => a.self === true);
+            if (selfIndex === -1) {
+              return errorResult({
+                error: attendees.length === 0
+                  ? `Event "${event.summary || eventId}" has no attendees, so there is no invitation for you to respond to.`
+                  : `Could not find your own attendee entry on this event (no attendee is flagged self:true). Make sure you are invited and that calendarId is your own calendar (use "primary").`,
+                resource: "event",
+                resourceId: eventId,
+                attendees: attendees.map(a => a.email).filter(Boolean),
+              });
+            }
+
+            // PATCH overwrites the attendees array, so rebuild the FULL list
+            // preserving every field on every attendee and change only our own
+            // responseStatus — otherwise other guests reset to needsAction.
+            const updatedAttendees = attendees.map((attendee, index) => {
+              if (index !== selfIndex) return attendee;
+              return {
+                ...attendee,
+                responseStatus,
+                ...(comment !== undefined && { comment }),
+              };
+            });
+
+            const patchUrl = new URL(eventUrl);
+            patchUrl.searchParams.set('sendUpdates', sendUpdates);
+
+            const patchRes = await googleFetch(patchUrl.toString(), {
+              method: 'PATCH',
+              headers: {
+                'Authorization': `Bearer ${googleToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+              body: JSON.stringify({ attendees: updatedAttendees }),
+            });
+            if (!patchRes.ok) {
+              return errorResult(mapGoogleError(patchRes, {
+                operation: "submit your event response",
+                resource: "event",
+                resourceId: eventId,
+              }));
+            }
+
+            const updatedEvent = (patchRes.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+            if (!updatedEvent.id) {
+              return errorResult({
+                error: "Google returned an unexpected response with no event id.",
+                bodyText: patchRes.bodyText,
+              });
+            }
+
+            const myResponseStatus =
+              updatedEvent.attendees?.find(a => a.self === true)?.responseStatus || responseStatus;
+
+            const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(updatedEvent.conferenceData);
+            return okResult({
+              id: updatedEvent.id,
+              summary: updatedEvent.summary,
+              start: formatDateTimeWithDay(updatedEvent.start),
+              end: formatDateTimeWithDay(updatedEvent.end),
+              myResponseStatus,
+              attendees: updatedEvent.attendees
+                ? updatedEvent.attendees
+                    .filter(a => typeof a.email === 'string')
+                    .map(a => ({ email: a.email, responseStatus: a.responseStatus || null }))
+                : [],
+              ...(typeof updatedEvent.htmlLink === 'string' && { htmlLink: updatedEvent.htmlLink }),
+              ...(sanitizedConf && { conferenceData: sanitizedConf }),
+              status: updatedEvent.status,
+              updated: updatedEvent.updated,
+              message: `Your response to "${updatedEvent.summary || eventId}" was set to ${myResponseStatus}.`,
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in respond_to_event: ${error?.message || String(error)}` });
           }
         })
       },
