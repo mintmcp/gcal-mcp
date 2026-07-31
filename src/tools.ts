@@ -310,6 +310,63 @@ interface ConferenceData {
   conferenceId?: string;
 }
 
+export interface EventAttendee {
+  email: string;
+  responseStatus?: string;
+  self?: boolean;
+  comment?: string;
+  [key: string]: unknown;
+}
+
+export type CallerAttendeeMatch =
+  | { kind: 'found'; attendee: EventAttendee }
+  | { kind: 'notFound' }
+  | { kind: 'unverifiableCalendar' };
+
+export function describeAttendeeRoster(attendees: EventAttendee[], sampleSize = 3): string {
+  const emails = attendees.map(a => a.email).filter(e => typeof e === 'string');
+  const sample = emails.slice(0, sampleSize).join(', ');
+  const rest = emails.length - sampleSize;
+  return `${attendees.length} attendee(s)${sample ? `, e.g. ${sample}${rest > 0 ? ` and ${rest} more` : ''}` : ''}`;
+}
+
+export function truncateBody(body: string | undefined, maxLength = 300): string {
+  const text = String(body ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+export function identifyCallerAttendee(
+  attendees: EventAttendee[],
+  callerEmail: string | undefined,
+  calendarId: string,
+): CallerAttendeeMatch {
+  const target = callerEmail ? callerEmail.toLowerCase() : undefined;
+  const byEmail = target
+    ? attendees.find(a => typeof a.email === 'string' && a.email.toLowerCase() === target)
+    : undefined;
+
+  const ownCalendar = calendarId === 'primary' || (target !== undefined && calendarId.toLowerCase() === target);
+  if (ownCalendar) {
+    const match = byEmail || attendees.find(a => a.self === true);
+    return match ? { kind: 'found', attendee: match } : { kind: 'notFound' };
+  }
+
+  if (!target) return { kind: 'unverifiableCalendar' };
+  return byEmail ? { kind: 'found', attendee: byEmail } : { kind: 'notFound' };
+}
+
+async function resolveCallerEmailFromPrimaryCalendar(googleToken: string): Promise<string | undefined> {
+  const res = await googleFetch("https://www.googleapis.com/calendar/v3/calendars/primary", {
+    headers: {
+      'Authorization': `Bearer ${googleToken}`,
+      'Accept': 'application/json',
+    },
+  });
+  if (!res.ok) return undefined;
+  const id = (res.bodyJson as { id?: unknown } | undefined)?.id;
+  return typeof id === 'string' && id.length > 0 ? id.toLowerCase() : undefined;
+}
+
 interface CalendarEvent {
   id: string;
   summary: string;
@@ -323,10 +380,9 @@ interface CalendarEvent {
   };
   description?: string;
   location?: string;
-  attendees?: Array<{
-    email: string;
-    responseStatus?: string;
-  }>;
+  attendees?: EventAttendee[];
+  attendeesOmitted?: boolean;
+  etag?: string;
   htmlLink?: string;
   hangoutLink?: string;
   conferenceData?: ConferenceData & {
@@ -833,7 +889,7 @@ export class GoogleCalendarTools {
           "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
           "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
           "`description` is rendered through Markdown to HTML by the server. " +
-          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. " +
+          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead — it preserves everyone else's responses. " +
           "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
         outputSchema: {
           id: z.string(),
@@ -988,6 +1044,242 @@ export class GoogleCalendarTools {
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in update_event: ${error?.message || String(error)}` });
+          }
+        })
+      },
+
+      respond_to_event: {
+        description:
+          "RSVP to a Google Calendar event as the authenticated user ONLY (accept, decline, or tentatively accept). " +
+          "Use this — NOT update_event — to set your own response: update_event replaces the whole attendee list and resets everyone's responseStatus to needsAction, whereas this tool reads the event, changes ONLY your own attendee entry (matched by your own email address), and echoes back every other attendee untouched so their responses are preserved. " +
+          "Always prefer calendarId='primary' (the default) — on a shared or delegated calendar your attendee entry cannot always be identified safely. " +
+          "For a recurring event, passing the series eventId responds for the ENTIRE series, while passing a single instance ID ('<eventId>_<UTC timestamp>', e.g. 'abc123_20240115T170000Z') responds for that one occurrence only. " +
+          "Optionally attach a `comment` for the organizer. `sendUpdates` controls whether your response notifies others. " +
+          "Returns the event with your updated response {id, summary, myResponseStatus, myComment, attendees, ...}, where myComment is your currently stored response comment (omitted when you have none).",
+        outputSchema: {
+          id: z.string(),
+          summary: z.string().optional(),
+          start: formattedDateTimeSchema,
+          end: formattedDateTimeSchema,
+          myResponseStatus: z.string(),
+          myComment: z.string().optional(),
+          attendees: z.array(attendeeSchema).optional(),
+          htmlLink: z.string().optional(),
+          conferenceData: conferenceDataSchema.optional(),
+          status: z.string().optional(),
+          updated: z.string().optional(),
+          message: z.string(),
+        },
+        schema: {
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar the event lives on. Defaults to "primary" (your own calendar), which is required for self-detection.'),
+          eventId: z
+            .string()
+            .describe("Event ID to respond to (from get_calendar_events). For a recurring event, the series ID responds for the whole series; a single instance ID ('<eventId>_<UTC timestamp>') responds for that occurrence only."),
+          responseStatus: z
+            .enum(['accepted', 'declined', 'tentative'])
+            .describe('Your RSVP: accepted, declined, or tentative.'),
+          comment: z.string().optional().describe('Optional response comment shown to the organizer.'),
+          sendUpdates: z
+            .enum(['all', 'externalOnly', 'none'])
+            .optional()
+            .default('all')
+            .describe('Whether to notify others of your response. all / externalOnly / none.'),
+        },
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
+          try {
+            const googleToken = context.accessToken;
+            const { calendarId, eventId, responseStatus, comment, sendUpdates } = params;
+
+            const encodedCalendarId = encodeURIComponent(calendarId);
+            const encodedEventId = encodeURIComponent(eventId);
+            const eventUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events/${encodedEventId}`;
+
+            const callerEmail = calendarId === 'primary'
+              ? undefined
+              : await resolveCallerEmailFromPrimaryCalendar(googleToken);
+
+            const buildRsvpResult = (
+              ev: CalendarEvent,
+              myResponseStatus: string,
+              message: string,
+              myComment?: unknown,
+            ) => {
+              const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(ev.conferenceData);
+              return okResult({
+                id: ev.id,
+                ...(typeof ev.summary === 'string' && { summary: ev.summary }),
+                start: formatDateTimeWithDay(ev.start),
+                end: formatDateTimeWithDay(ev.end),
+                myResponseStatus,
+                ...(typeof myComment === 'string' && myComment.length > 0 && { myComment }),
+                attendees: (ev.attendees || [])
+                  .filter(a => typeof a.email === 'string')
+                  .map(a => ({ email: a.email, responseStatus: a.responseStatus || null })),
+                ...(typeof ev.htmlLink === 'string' && { htmlLink: ev.htmlLink }),
+                ...(sanitizedConf && { conferenceData: sanitizedConf }),
+                status: ev.status,
+                updated: ev.updated,
+                message,
+              });
+            };
+
+            const concurrentEditError = {
+              error: `Event "${eventId}" is being changed by someone else right now, so your response was not saved (retrying immediately would risk overwriting their change). Try again in a moment.`,
+              resource: "event",
+              resourceId: eventId,
+            };
+
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              const getRes = await googleFetch(eventUrl, {
+                headers: {
+                  'Authorization': `Bearer ${googleToken}`,
+                  'Accept': 'application/json',
+                },
+              });
+              if (!getRes.ok) {
+                return errorResult(mapGoogleError(getRes, {
+                  operation: "load event to respond to",
+                  resource: "event",
+                  resourceId: eventId,
+                }));
+              }
+
+              const event = (getRes.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+              const attendees = event.attendees || [];
+              const eventLabel = event.summary || eventId;
+
+              if (event.status === 'cancelled') {
+                return errorResult({
+                  error: `Event "${eventLabel}" has been cancelled, so there is nothing to respond to.`,
+                  resource: "event",
+                  resourceId: eventId,
+                });
+              }
+
+              const match = identifyCallerAttendee(attendees, callerEmail, calendarId);
+
+              if (match.kind === 'unverifiableCalendar') {
+                return errorResult({
+                  error: `Your email address could not be determined, so your attendee entry on calendar "${calendarId}" cannot be proven to be yours (Google's 'self' flag identifies the calendar owner, not you). Call this tool again with calendarId='primary' to RSVP on your own calendar.`,
+                  resource: "event",
+                  resourceId: eventId,
+                });
+              }
+
+              if (match.kind === 'notFound') {
+                if (event.attendeesOmitted === true) {
+                  return errorResult({
+                    error: `Google truncated the guest list for event "${eventLabel}", so your attendee entry could not be located. Please RSVP in Google Calendar directly.`,
+                    resource: "event",
+                    resourceId: eventId,
+                  });
+                }
+                return errorResult({
+                  error: attendees.length === 0
+                    ? `Event "${eventLabel}" has no attendees, so there is no invitation for you to respond to.`
+                    : `Could not find your attendee entry on event "${eventLabel}". Make sure you are invited and that calendarId is your own calendar (use "primary").`,
+                  resource: "event",
+                  resourceId: eventId,
+                  attendees: describeAttendeeRoster(attendees),
+                });
+              }
+
+              const self = match.attendee;
+
+              if (self.responseStatus === responseStatus && (comment === undefined || self.comment === comment)) {
+                return buildRsvpResult(
+                  event,
+                  responseStatus,
+                  `Your response to "${eventLabel}" was already ${responseStatus}, so nothing was changed and no notifications were sent.`,
+                  self.comment,
+                );
+              }
+
+              if (event.attendeesOmitted === true) {
+                return errorResult({
+                  error: `Google truncated the guest list for event "${eventLabel}", so responding here would delete the attendees it left out. Please RSVP in Google Calendar directly.`,
+                  resource: "event",
+                  resourceId: eventId,
+                });
+              }
+
+              const updatedAttendees = attendees.map(attendee => attendee === self
+                ? { ...attendee, responseStatus, ...(comment !== undefined && { comment }) }
+                : attendee);
+
+              const patchUrl = new URL(eventUrl);
+              patchUrl.searchParams.set('sendUpdates', sendUpdates);
+
+              const patchHeaders: Record<string, string> = {
+                'Authorization': `Bearer ${googleToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              };
+              if (typeof event.etag === 'string' && event.etag.length > 0) {
+                patchHeaders['If-Match'] = event.etag;
+              }
+
+              const patchRes = await googleFetch(patchUrl.toString(), {
+                method: 'PATCH',
+                headers: patchHeaders,
+                body: JSON.stringify({ attendees: updatedAttendees }),
+              });
+
+              if (!patchRes.ok && patchRes.status === 412) {
+                if (attempt === 1) continue;
+                return errorResult(concurrentEditError);
+              }
+
+              if (!patchRes.ok) {
+                return errorResult(mapGoogleError(patchRes, {
+                  operation: "submit your event response",
+                  resource: "event",
+                  resourceId: eventId,
+                }));
+              }
+
+              try {
+                const updatedEvent = (patchRes.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+                if (!updatedEvent.id) {
+                  return errorResult({
+                    error: `Your ${responseStatus} response to event "${eventId}" WAS submitted successfully, but Google returned an unexpected response with no event id, so it could not be confirmed. Do NOT retry — retrying would re-notify every attendee. Read the event back to confirm.`,
+                    resource: "event",
+                    resourceId: eventId,
+                    bodyText: truncateBody(patchRes.bodyText),
+                  });
+                }
+
+                const updatedMatch = identifyCallerAttendee(updatedEvent.attendees || [], callerEmail, calendarId);
+                const storedStatus = updatedMatch.kind === 'found' ? updatedMatch.attendee.responseStatus : undefined;
+                const storedComment = updatedMatch.kind === 'found' ? updatedMatch.attendee.comment : undefined;
+                const eventName = updatedEvent.summary || eventId;
+
+                let message: string;
+                if (!storedStatus) {
+                  message = `Your ${responseStatus} response to "${eventName}" was submitted, but Google's reply did not include your attendee entry, so the stored value could not be confirmed.`;
+                } else if (storedStatus !== responseStatus) {
+                  message = `Your response to "${eventName}" was submitted as ${responseStatus}, but Google reports it as ${storedStatus}.`;
+                } else {
+                  message = `Your response to "${eventName}" was set to ${storedStatus}.`;
+                }
+
+                return buildRsvpResult(updatedEvent, storedStatus || 'unknown', message, storedComment);
+              } catch (postWriteError: any) {
+                return errorResult({
+                  error: `Your ${responseStatus} response to event "${eventId}" WAS submitted successfully, but the confirmation could not be read: ${postWriteError?.message || String(postWriteError)}. Do NOT retry — retrying would re-notify every attendee. Read the event back to confirm.`,
+                  resource: "event",
+                  resourceId: eventId,
+                });
+              }
+            }
+
+            return errorResult(concurrentEditError);
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in respond_to_event: ${error?.message || String(error)}` });
           }
         })
       },
