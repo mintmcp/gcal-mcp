@@ -1,7 +1,45 @@
 import { describe, expect, it } from 'vitest';
-import { identifyCallerAttendee } from '../tools.js';
+import { describeAttendeeRoster, identifyCallerAttendee, truncateBody } from '../tools.js';
 
 const caller = 'me@example.com';
+
+describe('describeAttendeeRoster', () => {
+  it('caps the disclosed roster to a sample plus a remainder count', () => {
+    const attendees = ['a', 'b', 'c', 'd', 'e'].map(n => ({ email: `${n}@example.com` }));
+    expect(describeAttendeeRoster(attendees)).toBe(
+      '5 attendee(s), e.g. a@example.com, b@example.com, c@example.com and 2 more',
+    );
+  });
+
+  it('omits the remainder when the roster fits in the sample', () => {
+    expect(describeAttendeeRoster([{ email: 'only@example.com' }])).toBe('1 attendee(s), e.g. only@example.com');
+  });
+
+  it('reports a count with no sample for an empty roster', () => {
+    expect(describeAttendeeRoster([])).toBe('0 attendee(s)');
+  });
+
+  it('ignores rows without a string email', () => {
+    const attendees = [{ email: undefined as unknown as string }, { email: 'real@example.com' }];
+    expect(describeAttendeeRoster(attendees)).toBe('2 attendee(s), e.g. real@example.com');
+  });
+});
+
+describe('truncateBody', () => {
+  it('truncates an over-long body and marks it', () => {
+    const out = truncateBody('x'.repeat(500));
+    expect(out).toHaveLength(303);
+    expect(out.endsWith('...')).toBe(true);
+  });
+
+  it('leaves a short body intact and collapses whitespace', () => {
+    expect(truncateBody('  hello   world \n')).toBe('hello world');
+  });
+
+  it('returns an empty string for a missing body', () => {
+    expect(truncateBody(undefined)).toBe('');
+  });
+});
 
 describe('identifyCallerAttendee', () => {
   it('matches the caller by email even when self:true belongs to someone else', () => {

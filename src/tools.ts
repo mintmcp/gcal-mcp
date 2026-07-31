@@ -323,6 +323,18 @@ export type CallerAttendeeMatch =
   | { kind: 'notFound' }
   | { kind: 'unverifiableCalendar' };
 
+export function describeAttendeeRoster(attendees: EventAttendee[], sampleSize = 3): string {
+  const emails = attendees.map(a => a.email).filter(e => typeof e === 'string');
+  const sample = emails.slice(0, sampleSize).join(', ');
+  const rest = emails.length - sampleSize;
+  return `${attendees.length} attendee(s)${sample ? `, e.g. ${sample}${rest > 0 ? ` and ${rest} more` : ''}` : ''}`;
+}
+
+export function truncateBody(body: string | undefined, maxLength = 300): string {
+  const text = String(body ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
 export function identifyCallerAttendee(
   attendees: EventAttendee[],
   callerEmail: string | undefined,
@@ -1172,7 +1184,7 @@ export class GoogleCalendarTools {
                     : `Could not find your attendee entry on event "${eventLabel}". Make sure you are invited and that calendarId is your own calendar (use "primary").`,
                   resource: "event",
                   resourceId: eventId,
-                  attendees: attendees.map(a => a.email).filter(Boolean),
+                  attendees: describeAttendeeRoster(attendees),
                 });
               }
 
@@ -1237,7 +1249,7 @@ export class GoogleCalendarTools {
                     error: `Your ${responseStatus} response to event "${eventId}" WAS submitted successfully, but Google returned an unexpected response with no event id, so it could not be confirmed. Do NOT retry — retrying would re-notify every attendee. Read the event back to confirm.`,
                     resource: "event",
                     resourceId: eventId,
-                    bodyText: patchRes.bodyText,
+                    bodyText: truncateBody(patchRes.bodyText),
                   });
                 }
 

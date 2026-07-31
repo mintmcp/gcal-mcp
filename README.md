@@ -41,7 +41,7 @@ Seven tools across four categories:
 
 - **Discovery** — `list_calendars`
 - **Read** — `get_calendar_events`
-- **Write** — `create_event`, `update_event`, `delete_event`, `respond_to_event` (self-RSVP: accept/decline/tentative without resetting other attendees)
+- **Write** — `create_event`, `update_event`, `delete_event`, `respond_to_event`
 - **Availability** — `get_next_availability` (free/busy slot finder)
 
 Every tool declares both `inputSchema` and `outputSchema` and returns
