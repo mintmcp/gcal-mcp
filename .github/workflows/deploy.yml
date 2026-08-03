@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mintmcp/mint-fly-deploy@main
+      - uses: mintmcp/mint-fly-deploy@v1
         with:
           env: ${{ env.TARGET_ENV }}
           fly-app: ${{ env.TARGET_ENV == 'prod' && 'gcal-mintmcp' || 'gcal-mintmcp-staging' }}
