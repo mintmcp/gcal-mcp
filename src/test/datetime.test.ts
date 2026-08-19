@@ -54,6 +54,12 @@ describe("formatDateTimeWithDay", () => {
     expect(out.time).toBeUndefined();
     expect(out.timezone).toBeUndefined();
   });
+
+  it("returns an empty shape for a missing start/end (e.g. a cancelled instance)", () => {
+    expect(formatDateTimeWithDay(undefined)).toEqual({ date: "", dayOfWeek: "" });
+    expect(formatDateTimeWithDay(null)).toEqual({ date: "", dayOfWeek: "" });
+    expect(formatDateTimeWithDay({})).toEqual({ date: "", dayOfWeek: "" });
+  });
 });
 
 describe("getOffset", () => {

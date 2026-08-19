@@ -37,10 +37,10 @@ connector requests for user identification.
 
 ## Tools
 
-Seven tools across four categories:
+Eight tools across four categories:
 
 - **Discovery** — `list_calendars`
-- **Read** — `get_calendar_events`
+- **Read** — `get_calendar_events`, `get_event`
 - **Write** — `create_event`, `update_event`, `delete_event`, `respond_to_event`
 - **Availability** — `get_next_availability` (free/busy slot finder)
 
