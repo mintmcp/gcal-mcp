@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { describeAttendeeRoster, identifyCallerAttendee, truncateBody } from '../tools.js';
+import { describeAttendeeRoster, GoogleCalendarTools, identifyCallerAttendee, truncateBody } from '../tools.js';
+
+// `toStructuredEvent` is private in TS but runtime-accessible; the cast exercises
+// the real mapper without widening the public surface.
+const toStructuredEvent = (event: unknown) => (GoogleCalendarTools as any).toStructuredEvent(event);
 
 const caller = 'me@example.com';
 
@@ -38,6 +42,63 @@ describe('truncateBody', () => {
 
   it('returns an empty string for a missing body', () => {
     expect(truncateBody(undefined)).toBe('');
+  });
+});
+
+describe('toStructuredEvent recurrence fields', () => {
+  it('exposes recurrence RRULEs so a series master is distinguishable from a one-time event', () => {
+    const out = toStructuredEvent({
+      id: 'series1',
+      summary: 'Weekly sync',
+      start: { dateTime: '2024-01-15T09:00:00-08:00' },
+      end: { dateTime: '2024-01-15T09:30:00-08:00' },
+      recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+    });
+    expect(out.recurrence).toEqual(['RRULE:FREQ=WEEKLY;BYDAY=MO']);
+    expect(out.recurringEventId).toBeUndefined();
+    expect(out.originalStartTime).toBeUndefined();
+  });
+
+  it('exposes recurringEventId and formatted originalStartTime for a moved instance', () => {
+    const out = toStructuredEvent({
+      id: 'series1_20240122T170000Z',
+      summary: 'Weekly sync',
+      start: { dateTime: '2024-01-23T10:00:00-08:00' },
+      end: { dateTime: '2024-01-23T10:30:00-08:00' },
+      recurringEventId: 'series1',
+      originalStartTime: { dateTime: '2024-01-22T09:00:00-08:00', timeZone: 'America/Los_Angeles' },
+    });
+    expect(out.recurringEventId).toBe('series1');
+    expect(out.originalStartTime).toEqual({
+      date: '2024-01-22',
+      time: '09:00:00',
+      dayOfWeek: 'Mon',
+      timezone: '-08:00',
+    });
+    expect(out.recurrence).toBeUndefined();
+  });
+
+  it('omits all recurrence fields for a plain one-time event', () => {
+    const out = toStructuredEvent({
+      id: 'plain1',
+      summary: 'Lunch',
+      start: { dateTime: '2024-01-15T12:00:00-08:00' },
+      end: { dateTime: '2024-01-15T13:00:00-08:00' },
+    });
+    expect(out).not.toHaveProperty('recurrence');
+    expect(out).not.toHaveProperty('recurringEventId');
+    expect(out).not.toHaveProperty('originalStartTime');
+  });
+
+  it('drops an empty recurrence array rather than emitting it', () => {
+    const out = toStructuredEvent({
+      id: 'plain1',
+      summary: 'Lunch',
+      start: { dateTime: '2024-01-15T12:00:00-08:00' },
+      end: { dateTime: '2024-01-15T13:00:00-08:00' },
+      recurrence: [],
+    });
+    expect(out).not.toHaveProperty('recurrence');
   });
 });
 

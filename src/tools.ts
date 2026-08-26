@@ -378,6 +378,13 @@ interface CalendarEvent {
     dateTime?: string;
     date?: string;
   };
+  recurrence?: string[];
+  recurringEventId?: string;
+  originalStartTime?: {
+    dateTime?: string;
+    date?: string;
+    timeZone?: string;
+  };
   description?: string;
   location?: string;
   attendees?: EventAttendee[];
@@ -483,6 +490,9 @@ const eventSchema = z.object({
   summary: z.string().optional(),
   start: formattedDateTimeSchema.optional(),
   end: formattedDateTimeSchema.optional(),
+  recurrence: z.array(z.string()).optional(),
+  recurringEventId: z.string().optional(),
+  originalStartTime: formattedDateTimeSchema.optional(),
   location: z.string().nullable().optional(),
   description: z.string().nullable().optional(),
   attendees: z.array(attendeeSchema).optional(),
@@ -531,6 +541,13 @@ export class GoogleCalendarTools {
             .filter(a => typeof a.email === 'string')
             .map(a => ({ email: a.email, responseStatus: a.responseStatus || null }))
         : [],
+      // Recurrence markers let a caller tell a series master (has `recurrence`
+      // RRULEs) from a single instance (has `recurringEventId`), navigate an
+      // instance back to its series, and detect a moved occurrence by comparing
+      // `originalStartTime` against `start`.
+      ...(Array.isArray(event.recurrence) && event.recurrence.length > 0 && { recurrence: event.recurrence }),
+      ...(typeof event.recurringEventId === 'string' && { recurringEventId: event.recurringEventId }),
+      ...(event.originalStartTime && { originalStartTime: formatDateTimeWithDay(event.originalStartTime) }),
       ...(typeof event.htmlLink === 'string' && { htmlLink: event.htmlLink }),
       ...(typeof event.hangoutLink === 'string' && { hangoutLink: event.hangoutLink }),
       ...(sanitizedConf && { conferenceData: sanitizedConf }),
@@ -744,7 +761,8 @@ export class GoogleCalendarTools {
           "Prefer this over get_calendar_events when you know the exact event: it is a direct lookup, not a time-range scan. " +
           "Defaults to the user's primary calendar; pass `calendarId` (from list_calendars) for a non-primary calendar. " +
           "For a recurring event, pass the series `eventId` to read the series master, or a single instance ID ('<eventId>_<UTC timestamp>', e.g. 'abc123_20240115T170000Z') to read that one occurrence. " +
-          "Returns the event {id, summary, start, end, location, description, attendees, ...}. Its `id` is the same value required by update_event / delete_event.",
+          "Returns the event {id, summary, start, end, location, description, attendees, ...}. Its `id` is the same value required by update_event / delete_event. " +
+          "Recurring events are distinguishable: a SERIES MASTER carries `recurrence` (RRULE strings describing the repeat pattern); a single INSTANCE carries `recurringEventId` (the series `id`, to navigate back to the master) and `originalStartTime` (its scheduled slot — if it differs from `start`, the occurrence was moved).",
         readOnlyHint: true,
         outputSchema: {
           calendarId: z.string(),
