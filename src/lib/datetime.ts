@@ -110,7 +110,12 @@ export function getDayOfWeek(dateStr: string): string {
 export function formatDateTimeWithDay(eventDateTime: {
   dateTime?: string;
   date?: string;
-}): FormattedDateTime {
+} | undefined | null): FormattedDateTime {
+  // A single-event fetch can return an event with no start/end (e.g. a
+  // cancelled recurring instance carries only id/status), so tolerate nullish.
+  if (!eventDateTime) {
+    return { date: "", dayOfWeek: "" };
+  }
   if (eventDateTime.dateTime) {
     const raw = eventDateTime.dateTime;
     const tIdx = raw.indexOf("T");

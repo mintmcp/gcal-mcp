@@ -378,6 +378,13 @@ interface CalendarEvent {
     dateTime?: string;
     date?: string;
   };
+  recurrence?: string[];
+  recurringEventId?: string;
+  originalStartTime?: {
+    dateTime?: string;
+    date?: string;
+    timeZone?: string;
+  };
   description?: string;
   location?: string;
   attendees?: EventAttendee[];
@@ -483,6 +490,9 @@ const eventSchema = z.object({
   summary: z.string().optional(),
   start: formattedDateTimeSchema.optional(),
   end: formattedDateTimeSchema.optional(),
+  recurrence: z.array(z.string()).optional(),
+  recurringEventId: z.string().optional(),
+  originalStartTime: formattedDateTimeSchema.optional(),
   location: z.string().nullable().optional(),
   description: z.string().nullable().optional(),
   attendees: z.array(attendeeSchema).optional(),
@@ -515,6 +525,33 @@ export class GoogleCalendarTools {
     }
     if (typeof cd.conferenceId === 'string') sanitized.conferenceId = cd.conferenceId;
     return Object.keys(sanitized).length > 0 ? sanitized : undefined;
+  }
+
+  private static toStructuredEvent(event: CalendarEvent) {
+    const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(event.conferenceData);
+    return {
+      id: event.id,
+      summary: event.summary || 'Untitled Event',
+      start: formatDateTimeWithDay(event.start),
+      end: formatDateTimeWithDay(event.end),
+      location: event.location || null,
+      description: event.description || null,
+      attendees: event.attendees
+        ? event.attendees
+            .filter(a => typeof a.email === 'string')
+            .map(a => ({ email: a.email, responseStatus: a.responseStatus || null }))
+        : [],
+      // Recurrence markers let a caller tell a series master (has `recurrence`
+      // RRULEs) from a single instance (has `recurringEventId`), navigate an
+      // instance back to its series, and detect a moved occurrence by comparing
+      // `originalStartTime` against `start`.
+      ...(Array.isArray(event.recurrence) && event.recurrence.length > 0 && { recurrence: event.recurrence }),
+      ...(typeof event.recurringEventId === 'string' && { recurringEventId: event.recurringEventId }),
+      ...(event.originalStartTime && { originalStartTime: formatDateTimeWithDay(event.originalStartTime) }),
+      ...(typeof event.htmlLink === 'string' && { htmlLink: event.htmlLink }),
+      ...(typeof event.hangoutLink === 'string' && { hangoutLink: event.hangoutLink }),
+      ...(sanitizedConf && { conferenceData: sanitizedConf }),
+    };
   }
 
   static getTools() {
@@ -701,23 +738,7 @@ export class GoogleCalendarTools {
 
             const structuredEvents = events.flatMap(event => {
               try {
-                const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(event.conferenceData);
-                return [{
-                  id: event.id,
-                  summary: event.summary || 'Untitled Event',
-                  start: formatDateTimeWithDay(event.start),
-                  end: formatDateTimeWithDay(event.end),
-                  location: event.location || null,
-                  description: event.description || null,
-                  attendees: event.attendees
-                    ? event.attendees
-                        .filter(a => typeof a.email === 'string')
-                        .map(a => ({ email: a.email, responseStatus: a.responseStatus || null }))
-                    : [],
-                  ...(typeof event.htmlLink === 'string' && { htmlLink: event.htmlLink }),
-                  ...(typeof event.hangoutLink === 'string' && { hangoutLink: event.hangoutLink }),
-                  ...(sanitizedConf && { conferenceData: sanitizedConf }),
-                }];
+                return [GoogleCalendarTools.toStructuredEvent(event)];
               } catch {
                 return [];
               }
@@ -730,6 +751,79 @@ export class GoogleCalendarTools {
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in get_calendar_events: ${error?.message || String(error)}` });
+          }
+        })
+      },
+
+      get_event: {
+        description:
+          "Fetch a SINGLE Google Calendar event by its `eventId` — use this when you already have an event's ID (from get_calendar_events, create_event, or a Google Calendar link) and want its full, current details. " +
+          "Prefer this over get_calendar_events when you know the exact event: it is a direct lookup, not a time-range scan. " +
+          "Defaults to the user's primary calendar; pass `calendarId` (from list_calendars) for a non-primary calendar. " +
+          "For a recurring event, pass the series `eventId` to read the series master, or a single instance ID ('<eventId>_<UTC timestamp>', e.g. 'abc123_20240115T170000Z') to read that one occurrence. " +
+          "Returns the event {id, summary, start, end, location, description, attendees, ...}. Its `id` is the same value required by update_event / delete_event. " +
+          "Recurring events are distinguishable: a SERIES MASTER carries `recurrence` (RRULE strings describing the repeat pattern); a single INSTANCE carries `recurringEventId` (the series `id`, to navigate back to the master) and `originalStartTime` (its scheduled slot — if it differs from `start`, the occurrence was moved).",
+        readOnlyHint: true,
+        outputSchema: {
+          calendarId: z.string(),
+          event: eventSchema,
+        },
+        schema: {
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar containing the event. Defaults to "primary". Use list_calendars to discover other calendar IDs.'),
+          eventId: z.string().describe('Event ID to fetch (from get_calendar_events, create_event, or a calendar link).'),
+          timeZone: z
+            .string()
+            .optional()
+            .default("UTC")
+            .describe('IANA timezone (e.g. "America/Los_Angeles") used to format the returned event times. Default: UTC.'),
+        },
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, eventId, timeZone }: any, context: any) => {
+          try {
+            const googleToken = context.accessToken;
+            const encodedCalendarId = encodeURIComponent(calendarId);
+            const encodedEventId = encodeURIComponent(eventId);
+            const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events/${encodedEventId}`);
+            if (timeZone) url.searchParams.set('timeZone', timeZone);
+
+            const res = await googleFetch(url.toString(), {
+              headers: {
+                'Authorization': `Bearer ${googleToken}`,
+                'Accept': 'application/json',
+              },
+            });
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "fetch calendar event",
+                resource: "event",
+                resourceId: eventId,
+              }));
+            }
+
+            const event = (res.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+            if (!event.id) {
+              return errorResult({
+                error: "Google returned an unexpected response with no event id.",
+                bodyText: truncateBody(res.bodyText),
+              });
+            }
+
+            return okResult({
+              calendarId,
+              event: {
+                ...GoogleCalendarTools.toStructuredEvent(event),
+                // attendeesOmitted signals Google truncated a large guest list;
+                // surface it so callers know the roster may be incomplete.
+                ...(event.attendeesOmitted === true && { attendeesOmitted: true }),
+                status: event.status,
+                updated: event.updated,
+              },
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in get_event: ${error?.message || String(error)}` });
           }
         })
       },
