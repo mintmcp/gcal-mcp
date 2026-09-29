@@ -4,13 +4,14 @@ import { GoogleCalendarTools } from "./tools.js";
 const SERVER_NAME = "Google Calendar";
 const SERVER_VERSION = "0.1.0";
 
+// Built once: createServer runs per request, and rebuilding every Zod shape
+// each time would put that cost on every call
+const TOOLS = Object.entries(GoogleCalendarTools.getTools()) as Array<[string, any]>;
+
 export function createServer(): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
-  const tools = GoogleCalendarTools.getTools();
-
-  for (const [toolName, toolConfig] of Object.entries(tools)) {
-    const t = toolConfig as any;
+  for (const [toolName, t] of TOOLS) {
     server.registerTool(
       toolName,
       {
