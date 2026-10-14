@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { requestContext } from '../auth.js';
 import { describeAttendeeRoster, GoogleCalendarTools, identifyCallerAttendee, truncateBody } from '../tools.js';
 
 // `toStructuredEvent` is private in TS but runtime-accessible; the cast exercises
@@ -167,5 +168,87 @@ describe('identifyCallerAttendee', () => {
     const broken = { email: undefined as unknown as string, self: true };
     const mine = { email: caller };
     expect(identifyCallerAttendee([broken, mine], caller, 'primary')).toEqual({ kind: 'found', attendee: mine });
+  });
+});
+
+describe('search_events', () => {
+  const searchEvents = GoogleCalendarTools.getTools().search_events.handler;
+  const defaults = { calendarId: 'primary', maxResults: 25, timeZone: 'UTC' };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubGoogle(body: unknown, status = 200) {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  const run = (args: Record<string, unknown>) =>
+    requestContext.run({ accessToken: 'token' }, () => searchEvents({ ...defaults, ...args })) as Promise<any>;
+  const requestedUrl = (fetchMock: ReturnType<typeof stubGoogle>) => new URL(String(fetchMock.mock.calls[0][0]));
+
+  it('sends the query as Google free-text search over expanded instances, with no default time bound', async () => {
+    const fetchMock = stubGoogle({ items: [] });
+    await run({ query: 'dentist' });
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe('/calendar/v3/calendars/primary/events');
+    expect(url.searchParams.get('q')).toBe('dentist');
+    expect(url.searchParams.get('singleEvents')).toBe('true');
+    expect(url.searchParams.get('orderBy')).toBe('startTime');
+    expect(url.searchParams.has('timeMin')).toBe(false);
+    expect(url.searchParams.has('timeMax')).toBe(false);
+  });
+
+  it('resolves time bounds in the requested timezone', async () => {
+    const fetchMock = stubGoogle({ items: [] });
+    await run({ query: 'offsite', timeMin: '2024-01-15', timeMax: '2024-02-01T00:00:00Z', timeZone: 'America/Los_Angeles' });
+    const url = requestedUrl(fetchMock);
+    expect(url.searchParams.get('timeMin')).toBe('2024-01-15T00:00:00-08:00');
+    expect(url.searchParams.get('timeMax')).toBe('2024-02-01T00:00:00Z');
+  });
+
+  it('rejects an invalid time bound without calling Google', async () => {
+    const fetchMock = stubGoogle({ items: [] });
+    const out = await run({ query: 'offsite', timeMin: 'next week' });
+    expect(out.isError).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('returns matching events in the shared event shape', async () => {
+    stubGoogle({
+      items: [{
+        id: 'ev1',
+        summary: 'Dentist',
+        start: { dateTime: '2024-01-15T09:00:00Z' },
+        end: { dateTime: '2024-01-15T10:00:00Z' },
+      }],
+      nextPageToken: 'next',
+    });
+    const out = await run({ query: 'dentist' });
+    expect(out.structuredContent).toMatchObject({
+      calendarId: 'primary',
+      query: 'dentist',
+      nextPageToken: 'next',
+      events: [{ id: 'ev1', summary: 'Dentist', start: { date: '2024-01-15', time: '09:00:00' } }],
+    });
+  });
+
+  it('keeps the page token when Google returns an empty page with more results pending', async () => {
+    stubGoogle({ items: [], nextPageToken: 'more' });
+    const out = await run({ query: 'dentist' });
+    expect(out.structuredContent.events).toEqual([]);
+    expect(out.structuredContent.nextPageToken).toBe('more');
+  });
+
+  it('maps a Google error to a structured tool error', async () => {
+    stubGoogle({ error: { message: 'Not Found' } }, 404);
+    const out = await run({ query: 'dentist', calendarId: 'missing@example.com' });
+    expect(out.isError).toBe(true);
+    expect(JSON.parse(out.content[0].text)).toMatchObject({ operation: 'search calendar events', status: 404 });
   });
 });

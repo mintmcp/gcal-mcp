@@ -88,6 +88,20 @@ export function attachOffsetForTimezone(naiveIso: string, timeZone: string): str
 }
 
 /**
+ * Resolve a user-supplied ISO 8601 time bound to RFC3339 for the Calendar API.
+ * Date-only inputs mean the start of that day in `timeZone`; naive datetimes
+ * are interpreted in `timeZone`; zone-aware inputs pass through unchanged.
+ * Returns null on invalid input.
+ */
+export function resolveTimeBound(input: string, timeZone: string): string | null {
+  const parsed = parseIso(input);
+  if (!parsed) return null;
+  if (parsed.kind === "date") return attachOffsetForTimezone(`${parsed.date}T00:00:00`, timeZone);
+  if (parsed.hasOffset) return parsed.rfc3339;
+  return attachOffsetForTimezone(parsed.rfc3339, timeZone);
+}
+
+/**
  * Day-of-week label ("Sun".."Sat") for the wall-clock date portion of an ISO
  * datetime or date-only string. Anchors at UTC noon to dodge DST/edge issues
  * so the day reported is whichever day the event appears on in the calendar.

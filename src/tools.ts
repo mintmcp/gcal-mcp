@@ -4,6 +4,7 @@ import MarkdownIt from 'markdown-it';
 import {
   parseIso,
   attachOffsetForTimezone,
+  resolveTimeBound,
   getDayOfWeek,
   formatDateTimeWithDay,
   normalizeAttendees,
@@ -676,36 +677,22 @@ export class GoogleCalendarTools {
             if (!timeMin) {
               resolvedTimeMin = new Date().toISOString();
             } else {
-              const parsed = parseIso(timeMin);
-              if (!parsed) {
+              const resolved = resolveTimeBound(timeMin, timeZone);
+              if (!resolved) {
                 return errorResult({
                   error: `Invalid timeMin "${timeMin}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
                 });
               }
-              if (parsed.kind === "date") {
-                resolvedTimeMin = attachOffsetForTimezone(`${parsed.date}T00:00:00`, timeZone);
-              } else if (parsed.hasOffset) {
-                resolvedTimeMin = parsed.rfc3339;
-              } else {
-                resolvedTimeMin = attachOffsetForTimezone(parsed.rfc3339, timeZone);
-              }
+              resolvedTimeMin = resolved;
             }
             url.searchParams.set('timeMin', resolvedTimeMin);
 
             if (timeMax) {
-              const parsedMax = parseIso(timeMax);
-              if (!parsedMax) {
+              const resolvedTimeMax = resolveTimeBound(timeMax, timeZone);
+              if (!resolvedTimeMax) {
                 return errorResult({
                   error: `Invalid timeMax "${timeMax}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
                 });
-              }
-              let resolvedTimeMax: string;
-              if (parsedMax.kind === "date") {
-                resolvedTimeMax = attachOffsetForTimezone(`${parsedMax.date}T00:00:00`, timeZone);
-              } else if (parsedMax.hasOffset) {
-                resolvedTimeMax = parsedMax.rfc3339;
-              } else {
-                resolvedTimeMax = attachOffsetForTimezone(parsedMax.rfc3339, timeZone);
               }
               url.searchParams.set('timeMax', resolvedTimeMax);
             }
@@ -751,6 +738,130 @@ export class GoogleCalendarTools {
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in get_calendar_events: ${error?.message || String(error)}` });
+          }
+        })
+      },
+
+      search_events: {
+        description:
+          "Search a Google Calendar for events matching a keyword or phrase — use this when the user describes an event by WHAT it is (\"my dentist appointment\", \"the offsite\", \"meetings with Alice\") rather than WHEN it is. " +
+          "`query` is free-text, case-insensitive, and matched by Google against the event title, description, location, attendee names/emails, and organizer name/email. " +
+          "Searches ALL time by default (past and future); narrow with `timeMin` / `timeMax` — e.g. set `timeMin` to today to find only upcoming matches. " +
+          "Results are expanded recurring instances in ascending start-time order, so without `timeMin` the oldest matches come first. " +
+          "Time inputs accept the same ISO 8601 forms as get_calendar_events. Defaults to the user's primary calendar; call list_calendars first only for a non-primary calendar's ID. " +
+          "If `nextPageToken` is returned, more events match — pass it back as `pageToken` (with the same `query`) to continue. " +
+          "Event `id`s in the response work with get_event / update_event / delete_event / respond_to_event.",
+        readOnlyHint: true,
+        outputSchema: {
+          calendarId: z.string(),
+          query: z.string(),
+          events: z.array(eventSchema),
+          nextPageToken: z.string().nullable(),
+          message: z.string().optional(),
+        },
+        schema: {
+          query: z.string().trim().min(1).describe('Keyword(s) or phrase to search for (e.g. "dentist", "Q3 planning", "alice@example.com"). Case-insensitive.'),
+          calendarId: z
+            .string()
+            .optional()
+            .default("primary")
+            .describe('Calendar ID. Defaults to "primary" (the user\'s main calendar). Use list_calendars to discover other calendar IDs.'),
+          maxResults: z.coerce.number().int().optional().default(25).describe('Number of events to return (1-2500). Default: 25. Google may return slightly fewer; check `nextPageToken`.'),
+          timeMin: z
+            .string()
+            .optional()
+            .describe('Optional lower time bound (inclusive) as ISO 8601: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM[:SS]", or "...Z"/"...±HH:MM". Omit to search from the beginning of the calendar. Naive forms are interpreted in `timeZone`.'),
+          timeMax: z
+            .string()
+            .optional()
+            .describe('Optional upper time bound (EXCLUSIVE) as ISO 8601 — same formats as `timeMin`. Omit to search without an upper limit.'),
+          timeZone: z
+            .string()
+            .optional()
+            .default("UTC")
+            .describe('IANA timezone (e.g. "America/Los_Angeles") used to interpret naive/date-only inputs and to format response times. Default: UTC.'),
+          pageToken: z.string().optional().describe('Pagination token from a prior call\'s `nextPageToken`. Pass it back to fetch the next page.'),
+        },
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ query, calendarId, maxResults, timeMin, timeMax, timeZone, pageToken }: any, context: any) => {
+          try {
+            const googleToken = context.accessToken;
+            const encodedCalendarId = encodeURIComponent(calendarId);
+            const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
+
+            url.searchParams.set('q', query);
+            url.searchParams.set('maxResults', Math.min(Math.max(1, maxResults), 2500).toString());
+            url.searchParams.set('singleEvents', 'true');
+            url.searchParams.set('orderBy', 'startTime');
+            if (pageToken) url.searchParams.set('pageToken', pageToken);
+            if (timeZone) url.searchParams.set('timeZone', timeZone);
+
+            if (timeMin) {
+              const resolvedTimeMin = resolveTimeBound(timeMin, timeZone);
+              if (!resolvedTimeMin) {
+                return errorResult({
+                  error: `Invalid timeMin "${timeMin}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
+                });
+              }
+              url.searchParams.set('timeMin', resolvedTimeMin);
+            }
+
+            if (timeMax) {
+              const resolvedTimeMax = resolveTimeBound(timeMax, timeZone);
+              if (!resolvedTimeMax) {
+                return errorResult({
+                  error: `Invalid timeMax "${timeMax}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
+                });
+              }
+              url.searchParams.set('timeMax', resolvedTimeMax);
+            }
+
+            const res = await googleFetch(url.toString(), {
+              headers: {
+                'Authorization': `Bearer ${googleToken}`,
+                'Accept': 'application/json',
+              },
+            });
+            if (!res.ok) {
+              return errorResult(mapGoogleError(res, {
+                operation: "search calendar events",
+                resource: "calendar",
+                resourceId: calendarId,
+              }));
+            }
+
+            const data = (res.bodyJson as EventsListResponse) || { items: [] };
+            const events = data.items || [];
+
+            // Google can return an empty page that still has a nextPageToken, so
+            // keep the token rather than reporting the search as exhausted.
+            if (events.length === 0) {
+              return okResult({
+                calendarId,
+                query,
+                events: [] as any[],
+                nextPageToken: data.nextPageToken || null,
+                message: data.nextPageToken
+                  ? `No matches on this page for "${query}"; more results may follow — pass nextPageToken back as pageToken`
+                  : `No events matching "${query}" found in calendar "${calendarId}" for the specified time range`
+              });
+            }
+
+            const structuredEvents = events.flatMap(event => {
+              try {
+                return [GoogleCalendarTools.toStructuredEvent(event)];
+              } catch {
+                return [];
+              }
+            });
+
+            return okResult({
+              calendarId,
+              query,
+              events: structuredEvents,
+              nextPageToken: data.nextPageToken || null
+            });
+          } catch (error: any) {
+            return errorResult({ error: `Unexpected error in search_events: ${error?.message || String(error)}` });
           }
         })
       },

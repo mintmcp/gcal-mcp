@@ -4,6 +4,7 @@ import {
   formatDateTimeWithDay,
   getOffset,
   attachOffsetForTimezone,
+  resolveTimeBound,
   normalizeAttendees,
   isWithinSearchHours,
   alignToSlotBoundary,
@@ -83,6 +84,24 @@ describe("getOffset", () => {
     expect(getOffset("Europe/London", new Date("2024-06-15T12:00:00Z"))).toBe(
       "+01:00",
     );
+  });
+});
+
+describe("resolveTimeBound", () => {
+  it("anchors a date-only bound to the start of that day in the timezone", () => {
+    expect(resolveTimeBound("2024-01-15", "America/Los_Angeles")).toBe("2024-01-15T00:00:00-08:00");
+  });
+
+  it("interprets a naive datetime in the timezone", () => {
+    expect(resolveTimeBound("2024-07-15T09:00", "America/Los_Angeles")).toBe("2024-07-15T09:00-07:00");
+  });
+
+  it("passes a zone-aware datetime through unchanged", () => {
+    expect(resolveTimeBound("2024-01-15T09:00:00+02:00", "America/Los_Angeles")).toBe("2024-01-15T09:00:00+02:00");
+  });
+
+  it("returns null for input that is not ISO 8601", () => {
+    expect(resolveTimeBound("next tuesday", "UTC")).toBeNull();
   });
 });
 
