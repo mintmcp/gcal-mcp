@@ -83,7 +83,11 @@ export function attachOffsetForTimezone(naiveIso: string, timeZone: string): str
     throw new Error(`attachOffsetForTimezone: cannot parse naive ISO "${naiveIso}"`);
   }
   if (timeZone === "UTC") return `${naiveIso}Z`;
-  const offset = getOffset(timeZone, probe);
+  // The wall-clock time is first read as UTC to get a nearby instant, then
+  // re-read with that offset applied so a DST switch between the two instants
+  // yields the offset actually in force at the requested local time
+  const nearby = getOffset(timeZone, new Date(`${naiveIso}Z`));
+  const offset = getOffset(timeZone, new Date(`${naiveIso}${nearby}`));
   return `${naiveIso}${offset}`;
 }
 

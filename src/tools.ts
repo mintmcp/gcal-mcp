@@ -13,7 +13,23 @@ import {
   isSlotBusy,
   toLocalISO,
   type FormattedDateTime,
+  type ParsedIso,
 } from "./lib/datetime.js";
+import { buildEventOptions, mergeAttendees, type EventOptions } from "./lib/event-fields.js";
+import {
+  sanitizeConferenceData,
+  toStructuredEvent,
+  calendarSchema,
+  eventSchema,
+  formattedDateTimeSchema,
+  attendeeSchema,
+  conferenceDataSchema,
+  type EventAttendee,
+  type CalendarEvent,
+  type CalendarListResponse,
+  type EventsListResponse,
+  type FreeBusyResponse,
+} from "./lib/event-model.js";
 
 // `html: false` is intentional: descriptions come from LLM-generated text that
 // may inadvertently contain raw HTML/script tags. Disabling pass-through still
@@ -295,28 +311,6 @@ function okResult<T extends Record<string, unknown>>(structured: T) {
   };
 }
 
-interface ConferenceEntryPoint {
-  entryPointType: string;
-  uri: string;
-  label?: string;
-}
-
-interface ConferenceData {
-  entryPoints?: ConferenceEntryPoint[];
-  conferenceSolution?: {
-    name?: string;
-    iconUri?: string;
-  };
-  conferenceId?: string;
-}
-
-export interface EventAttendee {
-  email: string;
-  responseStatus?: string;
-  self?: boolean;
-  comment?: string;
-  [key: string]: unknown;
-}
 
 export type CallerAttendeeMatch =
   | { kind: 'found'; attendee: EventAttendee }
@@ -367,71 +361,86 @@ async function resolveCallerEmailFromPrimaryCalendar(googleToken: string): Promi
   return typeof id === 'string' && id.length > 0 ? id.toLowerCase() : undefined;
 }
 
-interface CalendarEvent {
-  id: string;
-  summary: string;
-  start: {
-    dateTime?: string;
-    date?: string;
-  };
-  end: {
-    dateTime?: string;
-    date?: string;
-  };
-  recurrence?: string[];
-  recurringEventId?: string;
-  originalStartTime?: {
-    dateTime?: string;
-    date?: string;
-    timeZone?: string;
-  };
-  description?: string;
-  location?: string;
-  attendees?: EventAttendee[];
-  attendeesOmitted?: boolean;
-  etag?: string;
-  htmlLink?: string;
-  hangoutLink?: string;
-  conferenceData?: ConferenceData & {
-    entryPoints?: Array<ConferenceEntryPoint & {
-      pin?: string;
-      accessCode?: string;
-      meetingCode?: string;
-      passcode?: string;
-      password?: string;
-    }>;
-  };
-  status?: string;
-  updated?: string;
+type ToolError = ReturnType<typeof errorResult>;
+
+async function fetchEvent(
+  googleToken: string,
+  calendarId: string,
+  eventId: string,
+  operation: string,
+): Promise<CalendarEvent | ToolError> {
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
+  const res = await googleFetch(url, {
+    headers: {
+      'Authorization': `Bearer ${googleToken}`,
+      'Accept': 'application/json',
+    },
+  });
+  if (!res.ok) {
+    return errorResult(mapGoogleError(res, { operation, resource: "event", resourceId: eventId }));
+  }
+  const event = (res.bodyJson as CalendarEvent) || ({} as CalendarEvent);
+  if (!event.id) {
+    return errorResult({
+      error: "Google returned an unexpected response with no event id.",
+      bodyText: truncateBody(res.bodyText),
+    });
+  }
+  return event;
 }
 
-interface Calendar {
-  id: string;
-  summary: string;
-  description?: string;
-  timeZone?: string;
-  accessRole?: string;
-  primary?: boolean;
+/**
+ * The calendar's own time zone, used to interpret naive date/time inputs when
+ * the caller did not name one. A lookup failure is returned as a tool error
+ * rather than guessed as UTC, because the zone decides the event instant
+ */
+async function fetchCalendarTimeZone(googleToken: string, calendarId: string): Promise<string | ToolError> {
+  const res = await googleFetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}`, {
+    headers: {
+      'Authorization': `Bearer ${googleToken}`,
+      'Accept': 'application/json',
+    },
+  });
+  if (!res.ok) {
+    return errorResult(mapGoogleError(res, {
+      operation: "read the calendar time zone (pass `timeZone` explicitly to skip this lookup)",
+      resource: "calendar",
+      resourceId: calendarId,
+    }));
+  }
+  const tz = (res.bodyJson as { timeZone?: unknown } | undefined)?.timeZone;
+  return typeof tz === 'string' && tz.length > 0 ? tz : "UTC";
 }
 
-interface CalendarListResponse {
-  items: Calendar[];
-  nextPageToken?: string;
-}
-
-interface EventsListResponse {
-  items: CalendarEvent[];
-  nextPageToken?: string;
-}
-
-interface FreeBusyResponse {
-  calendars: {
-    [calendarId: string]: {
-      busy: Array<{ start: string; end: string }>;
-      errors?: Array<{ reason: string }>;
-    };
+/**
+ * Build the Google `start`/`end` payload for a pair of parsed ISO inputs of
+ * the same kind. Naive datetimes get the explicit time zone, else the
+ * calendar's own, so "10:00" means 10:00 on the user's calendar. Google also
+ * demands a named zone on recurring timed events, offsets are not enough
+ */
+async function buildEventTimes(
+  googleToken: string,
+  calendarId: string,
+  start: ParsedIso,
+  end: ParsedIso,
+  explicitTimeZone: string | undefined,
+  recurring: boolean,
+): Promise<{ start: Record<string, string>; end: Record<string, string> } | ToolError> {
+  if (start.kind === "date" && end.kind === "date") {
+    return { start: { date: start.date }, end: { date: end.date } };
+  }
+  if (start.kind !== "datetime" || end.kind !== "datetime") {
+    throw new Error("`start` and `end` must be the same kind");
+  }
+  const needsZone = recurring || !start.hasOffset || !end.hasOffset;
+  const timeZone = explicitTimeZone ?? (needsZone ? await fetchCalendarTimeZone(googleToken, calendarId) : undefined);
+  if (timeZone !== undefined && typeof timeZone !== 'string') return timeZone;
+  return {
+    start: { dateTime: start.rfc3339, ...(timeZone && { timeZone }) },
+    end: { dateTime: end.rfc3339, ...(timeZone && { timeZone }) },
   };
 }
+
 
 // Reusable INPUT schema fragments.
 // Attendees may be supplied either as a bare email string ("alice@example.com")
@@ -446,113 +455,47 @@ const attendeeInputSchema = z.union([
   }),
 ]);
 
-// Reusable output schema fragments.
-// All schemas use .passthrough() + inner-optional fields so undocumented
-// Google Calendar response fields don't trigger output validation errors.
-const formattedDateTimeSchema = z.object({
-  date: z.string().optional(),
-  time: z.string().optional(),
-  dayOfWeek: z.string().optional(),
-  timezone: z.string().optional(),
-}).passthrough();
+const inputTimeZoneSchema = z
+  .string()
+  .optional()
+  .describe('IANA timezone (e.g. "America/Los_Angeles") used to interpret naive datetimes. Defaults to the calendar\'s own time zone.');
 
-const calendarSchema = z.object({
-  id: z.string().optional(),
-  summary: z.string().optional(),
-  description: z.string().optional(),
-  timeZone: z.string().optional(),
-  accessRole: z.string().optional(),
-  primary: z.boolean().optional(),
-}).passthrough();
+// Optional event fields accepted by both create_event and update_event
+const eventOptionsInputSchema = {
+  recurrence: z
+    .array(z.string())
+    .optional()
+    .describe('Recurrence rules as RFC 5545 strings, e.g. ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"] (RRULE, RDATE, EXDATE). Makes the event a recurring series. On update, pass [] to stop the series from repeating.'),
+  colorId: z
+    .string()
+    .optional()
+    .describe('Event colour ID "1"-"11" (1 lavender, 2 sage, 3 grape, 4 flamingo, 5 banana, 6 tangerine, 7 peacock, 8 graphite, 9 blueberry, 10 basil, 11 tomato).'),
+  visibility: z
+    .enum(['default', 'public', 'private', 'confidential'])
+    .optional()
+    .describe('Who can see event details: default (calendar setting), public, or private (attendees only).'),
+  availability: z
+    .enum(['busy', 'free'])
+    .optional()
+    .describe('Whether the event blocks time: busy (default) or free (shows as available).'),
+  reminders: z
+    .object({
+      useDefault: z.boolean().optional().describe('true: use the calendar default reminders. false with no overrides: no reminders at all.'),
+      overrides: z
+        .array(z.object({ method: z.enum(['email', 'popup']), minutes: z.coerce.number().int().min(0) }))
+        .optional()
+        .describe('Custom reminders, each {method: email|popup, minutes before start}. Replaces the calendar defaults.'),
+    })
+    .optional()
+    .describe('Reminder settings. Omit to keep the calendar defaults (or, on update, the existing reminders).'),
+  addGoogleMeet: z
+    .boolean()
+    .optional()
+    .describe('true: ask Google to create a Google Meet link for the event. The link is returned as `hangoutLink` / `conferenceData`.'),
+};
 
-const attendeeSchema = z.object({
-  email: z.string().optional(),
-  responseStatus: z.string().nullable().optional(),
-}).passthrough();
-
-const conferenceEntryPointSchema = z.object({
-  entryPointType: z.string().optional(),
-  uri: z.string().optional(),
-  label: z.string().optional(),
-}).passthrough();
-
-const conferenceDataSchema = z.object({
-  entryPoints: z.array(conferenceEntryPointSchema).optional(),
-  conferenceSolution: z.object({
-    name: z.string().optional(),
-    iconUri: z.string().optional(),
-  }).passthrough().optional(),
-  conferenceId: z.string().optional(),
-}).passthrough();
-
-const eventSchema = z.object({
-  id: z.string().optional(),
-  summary: z.string().optional(),
-  start: formattedDateTimeSchema.optional(),
-  end: formattedDateTimeSchema.optional(),
-  recurrence: z.array(z.string()).optional(),
-  recurringEventId: z.string().optional(),
-  originalStartTime: formattedDateTimeSchema.optional(),
-  location: z.string().nullable().optional(),
-  description: z.string().nullable().optional(),
-  attendees: z.array(attendeeSchema).optional(),
-  htmlLink: z.string().optional(),
-  hangoutLink: z.string().optional(),
-  conferenceData: conferenceDataSchema.optional(),
-  status: z.string().optional(),
-  updated: z.string().optional(),
-}).passthrough();
 
 export class GoogleCalendarTools {
-  private static sanitizeConferenceData(cd?: CalendarEvent['conferenceData']): ConferenceData | undefined {
-    if (!cd) return undefined;
-    const sanitized: ConferenceData = {};
-    if (Array.isArray(cd.entryPoints)) {
-      const entries = cd.entryPoints
-        .filter(ep => ep && typeof ep.entryPointType === 'string' && typeof ep.uri === 'string')
-        .map(ep => ({
-          entryPointType: ep.entryPointType,
-          uri: ep.uri,
-          ...(ep.label && { label: ep.label }),
-        }));
-      if (entries.length > 0) sanitized.entryPoints = entries;
-    }
-    if (cd.conferenceSolution) {
-      const sol: { name?: string; iconUri?: string } = {};
-      if (typeof cd.conferenceSolution.name === 'string') sol.name = cd.conferenceSolution.name;
-      if (typeof cd.conferenceSolution.iconUri === 'string') sol.iconUri = cd.conferenceSolution.iconUri;
-      if (Object.keys(sol).length > 0) sanitized.conferenceSolution = sol;
-    }
-    if (typeof cd.conferenceId === 'string') sanitized.conferenceId = cd.conferenceId;
-    return Object.keys(sanitized).length > 0 ? sanitized : undefined;
-  }
-
-  private static toStructuredEvent(event: CalendarEvent) {
-    const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(event.conferenceData);
-    return {
-      id: event.id,
-      summary: event.summary || 'Untitled Event',
-      start: formatDateTimeWithDay(event.start),
-      end: formatDateTimeWithDay(event.end),
-      location: event.location || null,
-      description: event.description || null,
-      attendees: event.attendees
-        ? event.attendees
-            .filter(a => typeof a.email === 'string')
-            .map(a => ({ email: a.email, responseStatus: a.responseStatus || null }))
-        : [],
-      // Recurrence markers let a caller tell a series master (has `recurrence`
-      // RRULEs) from a single instance (has `recurringEventId`), navigate an
-      // instance back to its series, and detect a moved occurrence by comparing
-      // `originalStartTime` against `start`.
-      ...(Array.isArray(event.recurrence) && event.recurrence.length > 0 && { recurrence: event.recurrence }),
-      ...(typeof event.recurringEventId === 'string' && { recurringEventId: event.recurringEventId }),
-      ...(event.originalStartTime && { originalStartTime: formatDateTimeWithDay(event.originalStartTime) }),
-      ...(typeof event.htmlLink === 'string' && { htmlLink: event.htmlLink }),
-      ...(typeof event.hangoutLink === 'string' && { hangoutLink: event.hangoutLink }),
-      ...(sanitizedConf && { conferenceData: sanitizedConf }),
-    };
-  }
 
   static getTools() {
     return {
@@ -623,7 +566,9 @@ export class GoogleCalendarTools {
           "Time inputs accept full ISO 8601 strings: 'YYYY-MM-DD' (treated as start of that day in `timeZone`), naive 'YYYY-MM-DDTHH:MM[:SS]' (combined with `timeZone`), or zone-aware '...Z' / '...±HH:MM'. " +
           "Without `timeMax`, returns the next `maxResults` events from `timeMin` onwards. " +
           "For a single calendar day, set `timeMin='2024-01-15'` and `timeMax='2024-01-16'` (end is EXCLUSIVE). " +
-          "If `nextPageToken` is returned, more events match — pass it back as `pageToken` to continue. " +
+          "Pass `q` to search by keyword (matches title, description, location, attendee names/emails); with `q` and no `timeMin`, the WHOLE calendar is searched, past included. " +
+          "Response times are formatted in `timeZone` when given, otherwise in the calendar's own time zone. " +
+          "If `nextPageToken` is returned, more events match — pass it back as `pageToken` together with the SAME `q`, time bounds and calendarId to continue. " +
           "Recurring events are returned as expanded instances; each `id` (which may contain a date suffix) targets that single occurrence in update_event/delete_event. " +
           "Event `id`s in the response are required for update_event / delete_event.",
         readOnlyHint: true,
@@ -655,11 +600,14 @@ export class GoogleCalendarTools {
           timeZone: z
             .string()
             .optional()
-            .default("UTC")
-            .describe('IANA timezone (e.g. "America/Los_Angeles") used to interpret naive/date-only inputs and to format response times. Default: UTC.'),
+            .describe('IANA timezone (e.g. "America/Los_Angeles") used to interpret naive/date-only inputs and to format response times. Defaults to the calendar\'s own time zone.'),
+          q: z
+            .string()
+            .optional()
+            .describe('Free-text search. Case-insensitive; matches title, description, location and attendee names/emails. Without `timeMin`, searches the whole calendar including the past.'),
           pageToken: z.string().optional().describe('Pagination token from a prior call\'s `nextPageToken`. Pass it back to fetch the next page.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, timeMin, timeMax, timeZone, pageToken }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, timeMin, timeMax, timeZone, q, pageToken }: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const encodedCalendarId = encodeURIComponent(calendarId);
@@ -670,45 +618,37 @@ export class GoogleCalendarTools {
             url.searchParams.set('orderBy', 'startTime');
             if (pageToken) url.searchParams.set('pageToken', pageToken);
             if (timeZone) url.searchParams.set('timeZone', timeZone);
+            if (q) url.searchParams.set('q', q);
 
-            // Resolve timeMin (default = now in RFC3339).
-            let resolvedTimeMin: string;
-            if (!timeMin) {
-              resolvedTimeMin = new Date().toISOString();
-            } else {
-              const parsed = parseIso(timeMin);
-              if (!parsed) {
-                return errorResult({
-                  error: `Invalid timeMin "${timeMin}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
-                });
-              }
-              if (parsed.kind === "date") {
-                resolvedTimeMin = attachOffsetForTimezone(`${parsed.date}T00:00:00`, timeZone);
-              } else if (parsed.hasOffset) {
-                resolvedTimeMin = parsed.rfc3339;
-              } else {
-                resolvedTimeMin = attachOffsetForTimezone(parsed.rfc3339, timeZone);
-              }
+            const parsedMin = timeMin ? parseIso(timeMin) : null;
+            if (timeMin && !parsedMin) {
+              return errorResult({
+                error: `Invalid timeMin "${timeMin}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
+              });
             }
-            url.searchParams.set('timeMin', resolvedTimeMin);
+            const parsedMax = timeMax ? parseIso(timeMax) : null;
+            if (timeMax && !parsedMax) {
+              return errorResult({
+                error: `Invalid timeMax "${timeMax}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
+              });
+            }
 
-            if (timeMax) {
-              const parsedMax = parseIso(timeMax);
-              if (!parsedMax) {
-                return errorResult({
-                  error: `Invalid timeMax "${timeMax}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`,
-                });
-              }
-              let resolvedTimeMax: string;
-              if (parsedMax.kind === "date") {
-                resolvedTimeMax = attachOffsetForTimezone(`${parsedMax.date}T00:00:00`, timeZone);
-              } else if (parsedMax.hasOffset) {
-                resolvedTimeMax = parsedMax.rfc3339;
-              } else {
-                resolvedTimeMax = attachOffsetForTimezone(parsedMax.rfc3339, timeZone);
-              }
-              url.searchParams.set('timeMax', resolvedTimeMax);
+            const isNaive = (p: ReturnType<typeof parseIso>) => p !== null && (p.kind === "date" || !p.hasOffset);
+            const tz = timeZone ?? (isNaive(parsedMin) || isNaive(parsedMax) ? await fetchCalendarTimeZone(googleToken, calendarId) : "UTC");
+            if (typeof tz !== 'string') return tz;
+            const toRfc3339 = (p: NonNullable<ReturnType<typeof parseIso>>) =>
+              p.kind === "date"
+                ? attachOffsetForTimezone(`${p.date}T00:00:00`, tz)
+                : p.hasOffset ? p.rfc3339 : attachOffsetForTimezone(p.rfc3339, tz);
+
+            // A keyword search with no lower bound covers the whole calendar;
+            // otherwise the default lower bound is now
+            if (parsedMin) {
+              url.searchParams.set('timeMin', toRfc3339(parsedMin));
+            } else if (!q) {
+              url.searchParams.set('timeMin', new Date().toISOString());
             }
+            if (parsedMax) url.searchParams.set('timeMax', toRfc3339(parsedMax));
 
             const res = await googleFetch(url.toString(), {
               headers: {
@@ -738,7 +678,7 @@ export class GoogleCalendarTools {
 
             const structuredEvents = events.flatMap(event => {
               try {
-                return [GoogleCalendarTools.toStructuredEvent(event)];
+                return [toStructuredEvent(event)];
               } catch {
                 return [];
               }
@@ -778,8 +718,7 @@ export class GoogleCalendarTools {
           timeZone: z
             .string()
             .optional()
-            .default("UTC")
-            .describe('IANA timezone (e.g. "America/Los_Angeles") used to format the returned event times. Default: UTC.'),
+            .describe('IANA timezone (e.g. "America/Los_Angeles") used to format the returned event times. Defaults to the calendar\'s own time zone.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, eventId, timeZone }: any, context: any) => {
           try {
@@ -813,14 +752,7 @@ export class GoogleCalendarTools {
 
             return okResult({
               calendarId,
-              event: {
-                ...GoogleCalendarTools.toStructuredEvent(event),
-                // attendeesOmitted signals Google truncated a large guest list;
-                // surface it so callers know the roster may be incomplete.
-                ...(event.attendeesOmitted === true && { attendeesOmitted: true }),
-                status: event.status,
-                updated: event.updated,
-              },
+              event: toStructuredEvent(event),
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in get_event: ${error?.message || String(error)}` });
@@ -835,20 +767,9 @@ export class GoogleCalendarTools {
           "Both `start` and `end` must be the same kind. Naive datetimes are interpreted in `timeZone`. " +
           "`description` is rendered through Markdown to HTML by the server. " +
           "When `attendees` are provided, Google sends invitations according to `sendUpdates` (default 'all'). " +
+          "Optional extras: `recurrence` (RRULE strings) for a repeating series, `addGoogleMeet` for a Meet link, `colorId`, `visibility`, `availability` (busy/free) and `reminders`. " +
           "Returns the created event including `id` which is required for update_event / delete_event.",
-        outputSchema: {
-          id: z.string(),
-          summary: z.string(),
-          start: formattedDateTimeSchema,
-          end: formattedDateTimeSchema,
-          location: z.string().optional(),
-          description: z.string().optional(),
-          attendees: z.array(attendeeSchema).optional(),
-          htmlLink: z.string().optional(),
-          hangoutLink: z.string().optional(),
-          conferenceData: conferenceDataSchema.optional(),
-          status: z.string().optional(),
-        },
+        outputSchema: eventSchema.shape,
         schema: {
           calendarId: z
             .string()
@@ -868,24 +789,21 @@ export class GoogleCalendarTools {
             .describe(
               'End as ISO 8601, same kind as `start`. For all-day, end date is EXCLUSIVE (use the next day for a single-day event). For timed, must be after `start`.'
             ),
-          timeZone: z
-            .string()
-            .optional()
-            .default("UTC")
-            .describe('IANA timezone (e.g. "America/Los_Angeles"). Used when `start`/`end` are naive datetimes or date-only. Default: UTC.'),
+          timeZone: inputTimeZoneSchema,
           attendees: z.array(attendeeInputSchema).optional().describe('Attendees to invite. Each item may be a bare email string ("alice@example.com") or an object {email, displayName?, optional?}. Set optional=true to mark an attendee as non-essential.'),
           sendUpdates: z
             .enum(['all', 'externalOnly', 'none'])
             .optional()
             .default('all')
             .describe('Invitation behaviour. all: notify everyone, externalOnly: only non-Google-Calendar users, none: no notifications.'),
+          ...eventOptionsInputSchema,
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const {
               calendarId, summary, description, location,
-              start, end, timeZone, attendees, sendUpdates
+              start, end, attendees, sendUpdates
             } = params;
 
             const parsedStart = parseIso(start);
@@ -906,22 +824,14 @@ export class GoogleCalendarTools {
               summary,
               description: description ? md.render(description) : undefined,
               location,
+              ...buildEventOptions(params as EventOptions),
             };
 
-            if (parsedStart.kind === "date" && parsedEnd.kind === "date") {
-              event.start = { date: parsedStart.date };
-              event.end = { date: parsedEnd.date };
-            } else if (parsedStart.kind === "datetime" && parsedEnd.kind === "datetime") {
-              // For Calendar API, send the dateTime as-is and let timeZone disambiguate naive forms.
-              event.start = {
-                dateTime: parsedStart.rfc3339,
-                ...(timeZone && { timeZone }),
-              };
-              event.end = {
-                dateTime: parsedEnd.rfc3339,
-                ...(timeZone && { timeZone }),
-              };
-            }
+            const times = await buildEventTimes(
+              googleToken, calendarId, parsedStart, parsedEnd, params.timeZone, (params.recurrence?.length ?? 0) > 0,
+            );
+            if ('isError' in times) return times;
+            Object.assign(event, times);
 
             const normalizedAttendees = normalizeAttendees(attendees);
             if (normalizedAttendees && normalizedAttendees.length > 0) {
@@ -931,6 +841,7 @@ export class GoogleCalendarTools {
             const encodedCalendarId = encodeURIComponent(calendarId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
             url.searchParams.set('sendUpdates', sendUpdates);
+            if (event.conferenceData) url.searchParams.set('conferenceDataVersion', '1');
 
             const res = await googleFetch(url.toString(), {
               method: 'POST',
@@ -957,20 +868,7 @@ export class GoogleCalendarTools {
               });
             }
 
-            const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(createdEvent.conferenceData);
-            return okResult({
-              id: createdEvent.id,
-              summary: createdEvent.summary,
-              start: formatDateTimeWithDay(createdEvent.start),
-              end: formatDateTimeWithDay(createdEvent.end),
-              location: createdEvent.location,
-              description: createdEvent.description,
-              attendees: createdEvent.attendees,
-              ...(typeof createdEvent.htmlLink === 'string' && { htmlLink: createdEvent.htmlLink }),
-              ...(typeof createdEvent.hangoutLink === 'string' && { hangoutLink: createdEvent.hangoutLink }),
-              ...(sanitizedConf && { conferenceData: sanitizedConf }),
-              status: createdEvent.status,
-            });
+            return okResult(toStructuredEvent(createdEvent));
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in create_event: ${error?.message || String(error)}` });
           }
@@ -983,22 +881,11 @@ export class GoogleCalendarTools {
           "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
           "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
           "`description` is rendered through Markdown to HTML by the server. " +
-          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To merely add one person, first call get_calendar_events to read the existing attendees, then send the union back. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead — it preserves everyone else's responses. " +
+          "To add or remove guests, use `addAttendees` / `removeAttendees`: everyone else keeps their current response. " +
+          "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead — it preserves everyone else's responses. " +
+          "Optional extras: `recurrence`, `addGoogleMeet`, `colorId`, `visibility`, `availability` (busy/free) and `reminders`. " +
           "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
-        outputSchema: {
-          id: z.string(),
-          summary: z.string(),
-          start: formattedDateTimeSchema,
-          end: formattedDateTimeSchema,
-          location: z.string().optional(),
-          description: z.string().optional(),
-          attendees: z.array(attendeeSchema).optional(),
-          htmlLink: z.string().optional(),
-          hangoutLink: z.string().optional(),
-          conferenceData: conferenceDataSchema.optional(),
-          status: z.string().optional(),
-          updated: z.string().optional(),
-        },
+        outputSchema: eventSchema.shape,
         schema: {
           calendarId: z
             .string()
@@ -1021,33 +908,45 @@ export class GoogleCalendarTools {
             .describe(
               'New end as ISO 8601, same kind as `start`. Required if `start` is provided.'
             ),
-          timeZone: z
-            .string()
-            .optional()
-            .default("UTC")
-            .describe('IANA timezone used to interpret naive `start`/`end` datetimes. Default: UTC.'),
+          timeZone: inputTimeZoneSchema,
           attendees: z
             .array(attendeeInputSchema)
             .optional()
-            .describe('REPLACES the entire attendee list with the given items (each a bare email or {email, displayName?, optional?}). Include existing attendees you want to keep. Pass [] to remove all.'),
+            .describe('REPLACES the entire attendee list with the given items (each a bare email or {email, displayName?, optional?}). Include existing attendees you want to keep. Pass [] to remove all. Prefer addAttendees / removeAttendees for incremental changes.'),
+          addAttendees: z
+            .array(attendeeInputSchema)
+            .optional()
+            .describe('Attendees to ADD (bare email or {email, displayName?, optional?}). Existing attendees and their responses are kept. Cannot be combined with `attendees`.'),
+          removeAttendees: z
+            .array(z.string())
+            .optional()
+            .describe('Email addresses of attendees to REMOVE. Everyone else keeps their response. Cannot be combined with `attendees`.'),
           sendUpdates: z
             .enum(['all', 'externalOnly', 'none'])
             .optional()
             .default('all')
             .describe('Notification behaviour. all / externalOnly / none.'),
+          ...eventOptionsInputSchema,
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const {
               calendarId, eventId, summary, description, location,
-              start, end, timeZone, attendees, sendUpdates
+              start, end, attendees, addAttendees, removeAttendees, sendUpdates
             } = params;
 
-            const updates: any = {};
+            const updates: any = buildEventOptions(params as EventOptions);
             if (summary !== undefined) updates.summary = summary;
             if (description !== undefined) updates.description = md.render(description);
             if (location !== undefined) updates.location = location;
+
+            const incremental = addAttendees !== undefined || removeAttendees !== undefined;
+            if (incremental && attendees !== undefined) {
+              return errorResult({
+                error: "Pass either `attendees` (full replacement) or `addAttendees` / `removeAttendees` (incremental), not both.",
+              });
+            }
 
             const hasStart = start !== undefined;
             const hasEnd = end !== undefined;
@@ -1072,29 +971,54 @@ export class GoogleCalendarTools {
                   error: "`start` and `end` must be the same kind (both date-only or both datetime).",
                 });
               }
-              if (parsedStart.kind === "date" && parsedEnd.kind === "date") {
-                updates.start = { date: parsedStart.date };
-                updates.end = { date: parsedEnd.date };
-              } else if (parsedStart.kind === "datetime" && parsedEnd.kind === "datetime") {
-                updates.start = {
-                  dateTime: parsedStart.rfc3339,
-                  ...(timeZone && { timeZone }),
-                };
-                updates.end = {
-                  dateTime: parsedEnd.rfc3339,
-                  ...(timeZone && { timeZone }),
-                };
-              }
-            }
-
-            if (attendees !== undefined) {
-              updates.attendees = normalizeAttendees(attendees) || [];
+              const times = await buildEventTimes(
+                googleToken, calendarId, parsedStart, parsedEnd, params.timeZone, (params.recurrence?.length ?? 0) > 0,
+              );
+              if ('isError' in times) return times;
+              Object.assign(updates, times);
             }
 
             const encodedCalendarId = encodeURIComponent(calendarId);
             const encodedEventId = encodeURIComponent(eventId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events/${encodedEventId}`);
             url.searchParams.set('sendUpdates', sendUpdates);
+            if (updates.conferenceData) url.searchParams.set('conferenceDataVersion', '1');
+
+            // Google requires a named zone on recurring timed events, so turning an
+            // existing offset-only event into a series re-sends its times with one
+            const makingRecurring = (params.recurrence?.length ?? 0) > 0 && !hasStart;
+            let current: CalendarEvent | undefined;
+            if (incremental || makingRecurring) {
+              const loaded = await fetchEvent(googleToken, calendarId, eventId, "load event before updating");
+              if ('isError' in loaded) return loaded;
+              current = loaded;
+            }
+
+            if (makingRecurring && current?.start?.dateTime && current.end?.dateTime && !current.start.timeZone) {
+              const tz = params.timeZone ?? await fetchCalendarTimeZone(googleToken, calendarId);
+              if (typeof tz !== 'string') return tz;
+              updates.start = { dateTime: current.start.dateTime, timeZone: tz };
+              updates.end = { dateTime: current.end.dateTime, timeZone: tz };
+            }
+
+            let ifMatch: string | undefined;
+            if (attendees !== undefined) {
+              updates.attendees = normalizeAttendees(attendees) || [];
+            } else if (current && incremental) {
+              if (current.attendeesOmitted === true) {
+                return errorResult({
+                  error: `Google truncated the guest list for event "${current.summary || eventId}", so changing attendees here would drop the ones it left out. Edit the guest list in Google Calendar directly.`,
+                  resource: "event",
+                  resourceId: eventId,
+                });
+              }
+              updates.attendees = mergeAttendees(
+                current.attendees,
+                normalizeAttendees(addAttendees) || [],
+                removeAttendees || [],
+              );
+              if (typeof current.etag === 'string' && current.etag.length > 0) ifMatch = current.etag;
+            }
 
             const res = await googleFetch(url.toString(), {
               method: 'PATCH',
@@ -1102,9 +1026,17 @@ export class GoogleCalendarTools {
                 'Authorization': `Bearer ${googleToken}`,
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
+                ...(ifMatch && { 'If-Match': ifMatch }),
               },
               body: JSON.stringify(updates),
             });
+            if (!res.ok && res.status === 412) {
+              return errorResult({
+                error: `Event "${eventId}" was changed by someone else between reading its guest list and updating it, so nothing was saved. Try again.`,
+                resource: "event",
+                resourceId: eventId,
+              });
+            }
             if (!res.ok) {
               return errorResult(mapGoogleError(res, {
                 operation: "update calendar event",
@@ -1121,21 +1053,7 @@ export class GoogleCalendarTools {
               });
             }
 
-            const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(updatedEvent.conferenceData);
-            return okResult({
-              id: updatedEvent.id,
-              summary: updatedEvent.summary,
-              start: formatDateTimeWithDay(updatedEvent.start),
-              end: formatDateTimeWithDay(updatedEvent.end),
-              location: updatedEvent.location,
-              description: updatedEvent.description,
-              attendees: updatedEvent.attendees,
-              ...(typeof updatedEvent.htmlLink === 'string' && { htmlLink: updatedEvent.htmlLink }),
-              ...(typeof updatedEvent.hangoutLink === 'string' && { hangoutLink: updatedEvent.hangoutLink }),
-              ...(sanitizedConf && { conferenceData: sanitizedConf }),
-              status: updatedEvent.status,
-              updated: updatedEvent.updated,
-            });
+            return okResult(toStructuredEvent(updatedEvent));
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in update_event: ${error?.message || String(error)}` });
           }
@@ -1202,7 +1120,7 @@ export class GoogleCalendarTools {
               message: string,
               myComment?: unknown,
             ) => {
-              const sanitizedConf = GoogleCalendarTools.sanitizeConferenceData(ev.conferenceData);
+              const sanitizedConf = sanitizeConferenceData(ev.conferenceData);
               return okResult({
                 id: ev.id,
                 ...(typeof ev.summary === 'string' && { summary: ev.summary }),
@@ -1441,17 +1359,19 @@ export class GoogleCalendarTools {
 
       get_next_availability: {
         description:
-          "Find the next available time slots in a single calendar by scanning Google's free/busy data. " +
+          "Find the next time slots that are free on EVERY listed calendar by scanning Google's free/busy data. " +
+          "Pass `calendarIds` (email addresses of the people to meet, or calendar IDs) to find a slot that works for several people; `calendarId` (default primary) is always included. " +
           "Pass `startFrom` as ISO 8601 (date-only, naive datetime, or with offset). Defaults to NOW. " +
           "`duration` is the desired meeting length in minutes. " +
           "Restrict to a daily window via `searchHoursStart`/`searchHoursEnd` (HH:MM[:SS] in `timezone`). " +
           "Restrict to specific weekdays via `includeDays` (default: Mon-Fri). " +
           "Slots align to `startTimeIncrement` (default 30 min) boundaries. " +
           "Returns up to `maxResults` slots (default 10) and a boolean `exhausted` flag — when `exhausted` is true, the full search window was scanned and no more slots exist; when false, paginate by calling again with `startFrom = searchedUntil`. " +
-          "CAVEAT: free/busy reflects ONLY the listed calendar — meetings on other calendars the user attends are NOT considered. Surface this to the user before confirming a slot.",
+          "CAVEAT: free/busy reflects ONLY the listed calendars — meetings on other calendars the user attends are NOT considered. Surface this to the user before confirming a slot.",
         readOnlyHint: true,
         outputSchema: {
           calendarId: z.string(),
+          calendarIds: z.array(z.string()),
           availableSlots: z.array(z.object({
             start: formattedDateTimeSchema,
             end: formattedDateTimeSchema,
@@ -1465,6 +1385,11 @@ export class GoogleCalendarTools {
             .optional()
             .default("primary")
             .describe('Calendar ID. Defaults to "primary".'),
+          calendarIds: z
+            .array(z.string())
+            .max(49)
+            .optional()
+            .describe('Additional calendars (max 49) that must ALSO be free, e.g. attendee email addresses ["alice@example.com"]. Their free/busy must be visible to the user.'),
           duration: z.coerce.number().int().positive().describe('Meeting length in minutes (e.g., 30, 60, 90). Required.'),
           timezone: z.string().describe('IANA timezone (e.g., "America/New_York", "UTC"). Used for `searchHoursStart`/`searchHoursEnd` and to format response times.'),
           startFrom: z
@@ -1514,9 +1439,13 @@ export class GoogleCalendarTools {
               startFrom,
               startTimeIncrement,
               calendarId,
+              calendarIds,
               maxResults,
               maxSearchDays,
             } = params;
+
+            const allCalendarIds: string[] = [calendarId, ...(calendarIds || [])]
+              .filter((id, i, arr) => arr.indexOf(id) === i);
 
             // Resolve startFrom — default to now.
             let searchStart: Date;
@@ -1550,7 +1479,7 @@ export class GoogleCalendarTools {
               timeMin: searchStart.toISOString(),
               timeMax: searchEnd.toISOString(),
               timeZone: timezone,
-              items: [{ id: calendarId }]
+              items: allCalendarIds.map(id => ({ id })),
             };
 
             const url = 'https://www.googleapis.com/calendar/v3/freeBusy';
@@ -1573,36 +1502,35 @@ export class GoogleCalendarTools {
 
             const data = (res.bodyJson as FreeBusyResponse) || ({ calendars: {} } as FreeBusyResponse);
 
-            const calendarData = data.calendars?.[calendarId];
-            if (!calendarData) {
-              return errorResult({
-                operation: "query free/busy for calendar",
-                resource: "calendar",
-                resourceId: calendarId,
-                error: `Calendar ID "${calendarId}" not present in free/busy response. Verify the ID via list_calendars.`,
-              });
-            }
-
-            if (calendarData.errors && calendarData.errors.length > 0) {
-              const e = calendarData.errors[0];
-              return errorResult({
-                operation: "query free/busy for calendar",
-                resource: "calendar",
-                resourceId: calendarId,
-                googleReason: e.reason,
-                error:
-                  e.reason === 'notFound'
-                    ? `Calendar "${calendarId}" not found. Verify via list_calendars.`
-                    : e.reason === 'forbidden'
-                      ? `Access denied for calendar "${calendarId}". The authenticated user cannot read its free/busy info.`
-                      : `Free/busy lookup failed for calendar "${calendarId}": ${e.reason || 'unknown error'}.`,
-              });
-            }
-            
-            // Collect all busy times from the calendar
             const busyTimes: Array<{start: Date, end: Date}> = [];
-            if (calendarData.busy) {
-              for (const busyPeriod of calendarData.busy) {
+            for (const id of allCalendarIds) {
+              const calendarData = data.calendars?.[id];
+              if (!calendarData) {
+                return errorResult({
+                  operation: "query free/busy for calendar",
+                  resource: "calendar",
+                  resourceId: id,
+                  error: `Calendar ID "${id}" not present in free/busy response. Verify the ID via list_calendars.`,
+                });
+              }
+
+              if (calendarData.errors && calendarData.errors.length > 0) {
+                const e = calendarData.errors[0];
+                return errorResult({
+                  operation: "query free/busy for calendar",
+                  resource: "calendar",
+                  resourceId: id,
+                  googleReason: e.reason,
+                  error:
+                    e.reason === 'notFound'
+                      ? `Calendar "${id}" not found. Verify via list_calendars.`
+                      : e.reason === 'forbidden'
+                        ? `Access denied for calendar "${id}". The authenticated user cannot read its free/busy info.`
+                        : `Free/busy lookup failed for calendar "${id}": ${e.reason || 'unknown error'}.`,
+                });
+              }
+
+              for (const busyPeriod of calendarData.busy || []) {
                 busyTimes.push({
                   start: new Date(busyPeriod.start),
                   end: new Date(busyPeriod.end)
@@ -1679,6 +1607,7 @@ export class GoogleCalendarTools {
 
             return okResult({
               calendarId,
+              calendarIds: allCalendarIds,
               availableSlots,
               searchedUntil: toLocalISO(searchedUntil, timezone),
               exhausted,

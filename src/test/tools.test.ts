@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { describeAttendeeRoster, GoogleCalendarTools, identifyCallerAttendee, truncateBody } from '../tools.js';
-
-// `toStructuredEvent` is private in TS but runtime-accessible; the cast exercises
-// the real mapper without widening the public surface.
-const toStructuredEvent = (event: unknown) => (GoogleCalendarTools as any).toStructuredEvent(event);
+import { describeAttendeeRoster, identifyCallerAttendee, truncateBody } from '../tools.js';
+import { toStructuredEvent } from '../lib/event-model.js';
 
 const caller = 'me@example.com';
 

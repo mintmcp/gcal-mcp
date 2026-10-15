@@ -105,6 +105,15 @@ describe("attachOffsetForTimezone", () => {
     );
   });
 
+  it("uses the offset in force at that wall-clock time right after a DST switch", () => {
+    expect(attachOffsetForTimezone("2026-03-08T03:30:00", "America/Los_Angeles")).toBe(
+      "2026-03-08T03:30:00-07:00",
+    );
+    expect(attachOffsetForTimezone("2026-11-01T03:30:00", "America/Los_Angeles")).toBe(
+      "2026-11-01T03:30:00-08:00",
+    );
+  });
+
   it("appends BST for Europe/London in summer", () => {
     expect(attachOffsetForTimezone("2024-06-15T12:00:00", "Europe/London")).toBe(
       "2024-06-15T12:00:00+01:00",
