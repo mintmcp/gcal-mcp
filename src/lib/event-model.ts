@@ -3,6 +3,7 @@
 
 import { z } from "zod";
 import { formatDateTimeWithDay } from "./datetime.js";
+import type { EventAttachment } from "./event-fields.js";
 
 export interface ConferenceEntryPoint {
   entryPointType: string;
@@ -79,6 +80,14 @@ export interface CalendarEvent {
   };
   status?: string;
   updated?: string;
+  attachments?: EventAttachment[];
+  guestsCanModify?: boolean;
+  guestsCanInviteOthers?: boolean;
+  guestsCanSeeOtherGuests?: boolean;
+  outOfOfficeProperties?: Record<string, unknown>;
+  focusTimeProperties?: Record<string, unknown>;
+  workingLocationProperties?: Record<string, unknown>;
+  birthdayProperties?: Record<string, unknown>;
 }
 
 export interface Calendar {
@@ -135,6 +144,8 @@ export const attendeeSchema = z.object({
   optional: z.boolean().optional(),
   organizer: z.boolean().optional(),
   self: z.boolean().optional(),
+  additionalGuests: z.number().optional(),
+  resource: z.boolean().optional(),
 }).passthrough();
 
 export const personSchema = z.object({
@@ -185,7 +196,43 @@ export const eventSchema = z.object({
   status: z.string().optional(),
   created: z.string().optional(),
   updated: z.string().optional(),
+  attachments: z.array(z.object({
+    fileUrl: z.string(),
+    title: z.string().optional(),
+    mimeType: z.string().optional(),
+    fileId: z.string().optional(),
+  }).passthrough()).optional(),
+  guestPermissions: z.object({
+    canModify: z.boolean().optional(),
+    canInviteOthers: z.boolean().optional(),
+    canSeeOtherGuests: z.boolean().optional(),
+  }).passthrough().optional(),
+  outOfOffice: z.record(z.string(), z.unknown()).optional(),
+  focusTime: z.record(z.string(), z.unknown()).optional(),
+  workingLocation: z.record(z.string(), z.unknown()).optional(),
+  birthday: z.record(z.string(), z.unknown()).optional(),
 }).passthrough();
+
+function toGuestPermissions(event: CalendarEvent) {
+  const out: Record<string, boolean> = {};
+  if (typeof event.guestsCanModify === 'boolean') out.canModify = event.guestsCanModify;
+  if (typeof event.guestsCanInviteOthers === 'boolean') out.canInviteOthers = event.guestsCanInviteOthers;
+  if (typeof event.guestsCanSeeOtherGuests === 'boolean') out.canSeeOtherGuests = event.guestsCanSeeOtherGuests;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function toAttachments(attachments: EventAttachment[] | undefined) {
+  if (!Array.isArray(attachments)) return undefined;
+  const out = attachments
+    .filter(a => a && typeof a.fileUrl === 'string')
+    .map(a => ({
+      fileUrl: a.fileUrl,
+      ...(typeof a.title === 'string' && a.title && { title: a.title }),
+      ...(typeof a.mimeType === 'string' && { mimeType: a.mimeType }),
+      ...(typeof a.fileId === 'string' && { fileId: a.fileId }),
+    }));
+  return out.length > 0 ? out : undefined;
+}
 
 function toPerson(p: EventPerson | undefined) {
   if (!p || typeof p.email !== 'string') return undefined;
@@ -217,6 +264,8 @@ export function sanitizeConferenceData(cd?: CalendarEvent['conferenceData']): Co
 
 export function toStructuredEvent(event: CalendarEvent) {
   const sanitizedConf = sanitizeConferenceData(event.conferenceData);
+  const attachments = toAttachments(event.attachments);
+  const guestPermissions = toGuestPermissions(event);
   return {
     id: event.id,
     summary: event.summary || 'Untitled Event',
@@ -234,6 +283,8 @@ export function toStructuredEvent(event: CalendarEvent) {
             ...(a.optional === true && { optional: true }),
             ...(a.organizer === true && { organizer: true }),
             ...(a.self === true && { self: true }),
+            ...(typeof a.additionalGuests === 'number' && a.additionalGuests > 0 && { additionalGuests: a.additionalGuests }),
+            ...(a.resource === true && { resource: true }),
           }))
       : [],
     // attendeesOmitted signals Google truncated a large guest list;
@@ -259,5 +310,11 @@ export function toStructuredEvent(event: CalendarEvent) {
     ...(typeof event.htmlLink === 'string' && { htmlLink: event.htmlLink }),
     ...(typeof event.hangoutLink === 'string' && { hangoutLink: event.hangoutLink }),
     ...(sanitizedConf && { conferenceData: sanitizedConf }),
+    ...(attachments && { attachments }),
+    ...(guestPermissions && { guestPermissions }),
+    ...(event.outOfOfficeProperties && { outOfOffice: event.outOfOfficeProperties }),
+    ...(event.focusTimeProperties && { focusTime: event.focusTimeProperties }),
+    ...(event.workingLocationProperties && { workingLocation: event.workingLocationProperties }),
+    ...(event.birthdayProperties && { birthday: event.birthdayProperties }),
   };
 }

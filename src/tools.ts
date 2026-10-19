@@ -15,7 +15,16 @@ import {
   type FormattedDateTime,
   type ParsedIso,
 } from "./lib/datetime.js";
-import { buildEventOptions, mergeAttendees, type EventOptions } from "./lib/event-fields.js";
+import {
+  buildEventOptions,
+  mergeAttendees,
+  mergeAttachments,
+  normalizeAttachments,
+  MAX_ATTACHMENTS,
+  type EventOptions,
+  type EventAttachment,
+  type AttachmentInput,
+} from "./lib/event-fields.js";
 import {
   sanitizeConferenceData,
   toStructuredEvent,
@@ -441,6 +450,137 @@ async function buildEventTimes(
   };
 }
 
+/**
+ * Build the Google body fragment for the optional event fields, turning the
+ * input-shape errors the pure helpers throw into tool errors
+ */
+function eventOptionsOrError(params: EventOptions): Record<string, unknown> | ToolError {
+  try {
+    return buildEventOptions(params);
+  } catch (err: any) {
+    return errorResult({ error: err?.message || String(err) });
+  }
+}
+
+function attachmentsOrError(input: Array<string | AttachmentInput>): EventAttachment[] | ToolError {
+  try {
+    if (input.length > MAX_ATTACHMENTS) {
+      return errorResult({ error: `An event can hold at most ${MAX_ATTACHMENTS} attachments, got ${input.length}.` });
+    }
+    return normalizeAttachments(input);
+  } catch (err: any) {
+    return errorResult({ error: err?.message || String(err) });
+  }
+}
+
+const ALL_DAY_FORBIDDEN_TYPES = new Set(["outOfOffice", "focusTime"]);
+
+/**
+ * Google only accepts out-of-office, focus-time and working-location events
+ * on the user's primary calendar with specific time shapes, and reports the
+ * refusal as a bare 400. Name the type so the caller knows which rule bit
+ */
+function eventTypeHint(eventType: string | undefined): Record<string, unknown> {
+  if (!eventType || eventType === "default") return {};
+  return {
+    eventType,
+    hint: `${eventType} events are only accepted on the user's primary calendar (calendarId "primary"); out-of-office and focus-time events must be timed, not all-day; working-location events must fit in one day.`,
+  };
+}
+
+// A page token minted when the caller let timeMin default to "now": it
+// carries that instant so the next page continues from the same bound
+// instead of a fresh "now" that would skip or repeat events
+const FROZEN_TOKEN_PREFIX = "gcalmin1.";
+
+function freezePageToken(googleToken: string, timeMin: string): string {
+  return FROZEN_TOKEN_PREFIX + Buffer.from(JSON.stringify({ t: googleToken, m: timeMin })).toString("base64url");
+}
+
+function thawPageToken(token: string): { googleToken: string; timeMin?: string } {
+  if (!token.startsWith(FROZEN_TOKEN_PREFIX)) return { googleToken: token };
+  try {
+    const parsed = JSON.parse(Buffer.from(token.slice(FROZEN_TOKEN_PREFIX.length), "base64url").toString("utf8"));
+    if (typeof parsed?.t === "string") {
+      return { googleToken: parsed.t, timeMin: typeof parsed.m === "string" ? parsed.m : undefined };
+    }
+  } catch {
+    // fall through: not one of ours after all
+  }
+  return { googleToken: token };
+}
+
+/** Milliseconds between an event's stored start and end */
+function storedDurationMs(event: CalendarEvent): number | undefined {
+  if (event.start?.dateTime && event.end?.dateTime) {
+    const ms = Date.parse(event.end.dateTime) - Date.parse(event.start.dateTime);
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  if (event.start?.date && event.end?.date) {
+    const ms = Date.parse(`${event.end.date}T00:00:00Z`) - Date.parse(`${event.start.date}T00:00:00Z`);
+    return Number.isFinite(ms) ? ms : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Build the Google `start`/`end` payload when the caller moved only the
+ * start: the end follows so the stored duration survives. Timed events are
+ * re-expressed in one named zone (explicit, then the event's own, then the
+ * calendar's) so the shifted end can be written as a wall-clock time
+ */
+async function buildShiftedTimes(
+  googleToken: string,
+  calendarId: string,
+  current: CalendarEvent,
+  start: ParsedIso,
+  explicitTimeZone: string | undefined,
+): Promise<{ start: Record<string, string>; end: Record<string, string> } | ToolError> {
+  const durationMs = storedDurationMs(current);
+  if (durationMs === undefined) {
+    return errorResult({ error: "The event has no stored start/end to derive a duration from; pass both `start` and `end`." });
+  }
+  if (start.kind === "date") {
+    if (!current.start?.date) {
+      return errorResult({ error: "This is a timed event; pass a datetime `start`, or pass both `start` and `end` as dates to make it all-day." });
+    }
+    const endDate = new Date(Date.parse(`${start.date}T00:00:00Z`) + durationMs).toISOString().slice(0, 10);
+    return { start: { date: start.date }, end: { date: endDate } };
+  }
+  if (!current.start?.dateTime) {
+    return errorResult({ error: "This is an all-day event; pass a date-only `start`, or pass both `start` and `end` as datetimes to make it timed." });
+  }
+  const timeZone = explicitTimeZone ?? current.start.timeZone ?? await fetchCalendarTimeZone(googleToken, calendarId);
+  if (typeof timeZone !== "string") return timeZone;
+  const startInstant = new Date(start.hasOffset ? start.rfc3339 : attachOffsetForTimezone(start.rfc3339, timeZone));
+  const endLocal = toLocalISO(new Date(startInstant.getTime() + durationMs), timeZone);
+  return {
+    start: { dateTime: start.rfc3339, timeZone },
+    end: { dateTime: endLocal, timeZone },
+  };
+}
+
+/** Build only the `end` payload for an end-only reschedule, matching the event's kind */
+async function buildEndOnly(
+  googleToken: string,
+  calendarId: string,
+  current: CalendarEvent,
+  end: ParsedIso,
+  explicitTimeZone: string | undefined,
+): Promise<{ end: Record<string, string> } | ToolError> {
+  if (end.kind === "date") {
+    if (!current.start?.date) {
+      return errorResult({ error: "This is a timed event; pass a datetime `end`, or pass both `start` and `end` as dates to make it all-day." });
+    }
+    return { end: { date: end.date } };
+  }
+  if (!current.start?.dateTime) {
+    return errorResult({ error: "This is an all-day event; pass a date-only `end`, or pass both `start` and `end` as datetimes to make it timed." });
+  }
+  const timeZone = explicitTimeZone ?? current.start.timeZone ?? (end.hasOffset ? undefined : await fetchCalendarTimeZone(googleToken, calendarId));
+  if (timeZone !== undefined && typeof timeZone !== "string") return timeZone;
+  return { end: { dateTime: end.rfc3339, ...(timeZone && { timeZone }) } };
+}
 
 // Reusable INPUT schema fragments.
 // Attendees may be supplied either as a bare email string ("alice@example.com")
@@ -452,8 +592,55 @@ const attendeeInputSchema = z.union([
     email: z.string(),
     displayName: z.string().optional(),
     optional: z.boolean().optional(),
+    additionalGuests: z.coerce.number().int().min(0).optional().describe('Number of extra guests this attendee brings.'),
+    resource: z.boolean().optional().describe('true when the email is a room or other resource calendar.'),
+    responseStatus: z.enum(['needsAction', 'accepted', 'declined', 'tentative']).optional().describe('Pre-set RSVP for this attendee (normally left out).'),
   }),
 ]);
+
+const attachmentInputSchema = z.union([
+  z.string(),
+  z.object({
+    fileUrl: z.string().optional(),
+    fileId: z.string().optional(),
+    title: z.string().optional(),
+  }),
+]).describe('A Google Drive file: its URL (docs.google.com/... or drive.google.com/...), its file id, or {fileUrl|fileId, title?}.');
+
+const attachmentsDescription = 'Google Drive files to attach. Each item is a Drive URL, a Drive file id, or {fileUrl|fileId, title?}. Google resolves the file; the caller must have access to it.';
+
+const eventTypeInputSchema = {
+  eventType: z
+    .enum(['default', 'outOfOffice', 'focusTime', 'workingLocation'])
+    .optional()
+    .describe('Kind of event. outOfOffice, focusTime and workingLocation are only accepted on the primary calendar; outOfOffice and focusTime must be timed (not all-day). Inferred from the matching settings object when omitted. Cannot be changed after creation.'),
+  outOfOffice: z
+    .object({
+      autoDeclineMode: z.enum(['declineNone', 'declineAllConflictingInvitations', 'declineOnlyNewConflictingInvitations']).optional().describe('Which conflicting invitations to decline automatically. Default: declineAllConflictingInvitations.'),
+      declineMessage: z.string().optional().describe('Message sent with the automatic declines.'),
+    })
+    .optional()
+    .describe('Settings for eventType=outOfOffice.'),
+  focusTime: z
+    .object({
+      autoDeclineMode: z.enum(['declineNone', 'declineAllConflictingInvitations', 'declineOnlyNewConflictingInvitations']).optional().describe('Default: declineNone.'),
+      chatStatus: z.enum(['available', 'doNotDisturb']).optional().describe('Google Chat status during the block. Default: doNotDisturb.'),
+      declineMessage: z.string().optional(),
+    })
+    .optional()
+    .describe('Settings for eventType=focusTime.'),
+  workingLocation: z
+    .object({
+      type: z.enum(['homeOffice', 'customLocation', 'officeLocation']).optional().describe('Default: homeOffice.'),
+      label: z.string().optional().describe('Required for customLocation; optional display label for officeLocation.'),
+      buildingId: z.string().optional(),
+      floorId: z.string().optional(),
+      floorSectionId: z.string().optional(),
+      deskId: z.string().optional(),
+    })
+    .optional()
+    .describe('Settings for eventType=workingLocation (all-day or timed).'),
+};
 
 const inputTimeZoneSchema = z
   .string()
@@ -492,6 +679,14 @@ const eventOptionsInputSchema = {
     .boolean()
     .optional()
     .describe('true: ask Google to create a Google Meet link for the event. The link is returned as `hangoutLink` / `conferenceData`.'),
+  guestPermissions: z
+    .object({
+      canModify: z.boolean().optional().describe('Guests may edit the event.'),
+      canInviteOthers: z.boolean().optional().describe('Guests may invite more people (Google default: true).'),
+      canSeeOtherGuests: z.boolean().optional().describe('Guests can see the guest list (Google default: true).'),
+    })
+    .optional()
+    .describe('What attendees other than the organizer may do. Omit a flag to leave it unchanged.'),
 };
 
 
@@ -568,8 +763,9 @@ export class GoogleCalendarTools {
           "For a single calendar day, set `timeMin='2024-01-15'` and `timeMax='2024-01-16'` (end is EXCLUSIVE). " +
           "Pass `q` to search by keyword (matches title, description, location, attendee names/emails); like any listing it starts at `timeMin` (default NOW) and runs oldest first, so pass an earlier `timeMin` only when the user asks about past events. " +
           "Response times are formatted in `timeZone` when given, otherwise in the calendar's own time zone. " +
-          "If `nextPageToken` is returned, more events match — pass it back as `pageToken` together with the SAME `q`, time bounds and calendarId to continue. " +
-          "Recurring events are returned as expanded instances; each `id` (which may contain a date suffix) targets that single occurrence in update_event/delete_event. " +
+          "If `nextPageToken` is returned, more events match — pass it back as `pageToken` together with the SAME `q`, filters, time bounds and calendarId to continue (when `timeMin` was omitted the token remembers the moment the listing started, so later pages do not drift). " +
+          "Recurring events are returned as expanded instances; each `id` (which may contain a date suffix) targets that single occurrence in update_event/delete_event. Set `expandRecurring=false` to get series masters instead. " +
+          "Filter by `eventTypes` (default, outOfOffice, focusTime, workingLocation, birthday, fromGmail); without it Google returns every type. `orderBy` is startTime (default) or updated; `showDeleted` includes cancelled events. " +
           "Event `id`s in the response are required for update_event / delete_event.",
         readOnlyHint: true,
         outputSchema: {
@@ -608,17 +804,47 @@ export class GoogleCalendarTools {
             .optional()
             .describe('Free-text search. Case-insensitive; matches title, description, location and attendee names/emails. Searches from `timeMin` (default NOW); pass an earlier `timeMin` to include past events.'),
           pageToken: z.string().optional().describe('Pagination token from a prior call\'s `nextPageToken`. Pass it back to fetch the next page.'),
+          eventTypes: z
+            .array(z.enum(['default', 'outOfOffice', 'focusTime', 'workingLocation', 'birthday', 'fromGmail']))
+            .min(1)
+            .optional()
+            .describe('Only return these event types, e.g. ["outOfOffice"] or ["workingLocation"]. Omit for every type.'),
+          orderBy: z
+            .enum(['startTime', 'updated'])
+            .optional()
+            .describe('startTime (default, ascending; requires expandRecurring=true) or updated (last modification, ascending).'),
+          showDeleted: z.boolean().optional().describe('true: include cancelled/deleted events (status "cancelled").'),
+          expandRecurring: z
+            .boolean()
+            .optional()
+            .default(true)
+            .describe('true (default): recurring events appear as individual instances. false: each series appears once as its master (with `recurrence`); ordering by startTime is then unavailable.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, timeMin, timeMax, timeZone, q, pageToken }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, timeMin, timeMax, timeZone, q, pageToken, eventTypes, orderBy, showDeleted, expandRecurring }: any, context: any) => {
           try {
             const googleToken = context.accessToken;
             const encodedCalendarId = encodeURIComponent(calendarId);
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
 
+            if (orderBy === 'startTime' && expandRecurring === false) {
+              return errorResult({
+                error: "Google can only order by startTime when recurring events are expanded. Use orderBy='updated' or expandRecurring=true.",
+              });
+            }
+
             url.searchParams.set('maxResults', Math.min(Math.max(1, maxResults), 2500).toString());
-            url.searchParams.set('singleEvents', 'true');
-            url.searchParams.set('orderBy', 'startTime');
-            if (pageToken) url.searchParams.set('pageToken', pageToken);
+            url.searchParams.set('singleEvents', expandRecurring === false ? 'false' : 'true');
+            const effectiveOrder = orderBy ?? (expandRecurring === false ? undefined : 'startTime');
+            if (effectiveOrder) url.searchParams.set('orderBy', effectiveOrder);
+            if (showDeleted) url.searchParams.set('showDeleted', 'true');
+            for (const t of eventTypes ?? []) url.searchParams.append('eventTypes', t);
+            const thawed = pageToken ? thawPageToken(pageToken) : undefined;
+            if (thawed?.timeMin && timeMin) {
+              return errorResult({
+                error: "This page token was issued for a listing whose `timeMin` defaulted to the moment it started; Google needs the same bounds on every page. Omit `timeMin` to continue, or drop `pageToken` to start a new listing.",
+              });
+            }
+            if (thawed) url.searchParams.set('pageToken', thawed.googleToken);
             if (timeZone) url.searchParams.set('timeZone', timeZone);
             if (q) url.searchParams.set('q', q);
 
@@ -646,10 +872,12 @@ export class GoogleCalendarTools {
             // Keyword searches keep the default of now too: Google can only order
             // by start time ascending, so an unbounded search would surface the
             // oldest matches first and hide the upcoming ones
+            let frozenMin: string | undefined;
             if (parsedMin) {
               url.searchParams.set('timeMin', toRfc3339(parsedMin));
             } else {
-              url.searchParams.set('timeMin', new Date().toISOString());
+              frozenMin = thawed?.timeMin ?? new Date().toISOString();
+              url.searchParams.set('timeMin', frozenMin);
             }
             if (parsedMax) url.searchParams.set('timeMax', toRfc3339(parsedMax));
 
@@ -669,7 +897,9 @@ export class GoogleCalendarTools {
 
             const data = (res.bodyJson as EventsListResponse) || { items: [] };
             const events = data.items || [];
-            const nextPageToken = data.nextPageToken || null;
+            const nextPageToken = data.nextPageToken
+              ? (frozenMin ? freezePageToken(data.nextPageToken, frozenMin) : data.nextPageToken)
+              : null;
 
             // Google may return an empty page that still has more matches behind it
             if (events.length === 0) {
@@ -774,7 +1004,8 @@ export class GoogleCalendarTools {
           "Both `start` and `end` must be the same kind. Naive datetimes are interpreted in `timeZone`. " +
           "`description` is rendered through Markdown to HTML by the server. " +
           "When `attendees` are provided, Google sends invitations according to `sendUpdates` (default 'all'). " +
-          "Optional extras: `recurrence` (RRULE strings) for a repeating series, `addGoogleMeet` for a Meet link, `colorId`, `visibility`, `availability` (busy/free) and `reminders`. " +
+          "Optional extras: `recurrence` (RRULE strings) for a repeating series, `addGoogleMeet` for a Meet link, `colorId`, `visibility`, `availability` (busy/free), `reminders`, `guestPermissions` and Drive `attachments`. " +
+          "Special kinds via `eventType`: outOfOffice (with `outOfOffice` decline settings), focusTime (`focusTime`), workingLocation (`workingLocation`); these are only accepted on the primary calendar. " +
           "Returns the created event including `id` which is required for update_event / delete_event.",
         outputSchema: eventSchema.shape,
         schema: {
@@ -803,7 +1034,9 @@ export class GoogleCalendarTools {
             .optional()
             .default('all')
             .describe('Invitation behaviour. all: notify everyone, externalOnly: only non-Google-Calendar users, none: no notifications.'),
+          attachments: z.array(attachmentInputSchema).optional().describe(attachmentsDescription),
           ...eventOptionsInputSchema,
+          ...eventTypeInputSchema,
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
           try {
@@ -827,12 +1060,33 @@ export class GoogleCalendarTools {
               });
             }
 
+            const options = eventOptionsOrError(params as EventOptions);
+            if ('isError' in options) return options;
+            const eventType = options.eventType as string | undefined;
+            if (parsedStart.kind === "date" && eventType && ALL_DAY_FORBIDDEN_TYPES.has(eventType)) {
+              return errorResult({
+                error: `${eventType} events must be timed: pass datetime \`start\`/\`end\`, not dates.`,
+                eventType,
+              });
+            }
+            if (eventType === "workingLocation" && parsedStart.kind === "date" && parsedEnd.kind === "date"
+              && Date.parse(`${parsedEnd.date}T00:00:00Z`) - Date.parse(`${parsedStart.date}T00:00:00Z`) !== 86_400_000) {
+              return errorResult({
+                error: "An all-day workingLocation event covers exactly one day: `end` must be the day after `start`. Create one event per day.",
+                eventType,
+              });
+            }
             const event: any = {
               summary,
               description: description ? md.render(description) : undefined,
               location,
-              ...buildEventOptions(params as EventOptions),
+              ...options,
             };
+            if (params.attachments !== undefined) {
+              const attachments = attachmentsOrError(params.attachments);
+              if ('isError' in attachments) return attachments;
+              event.attachments = attachments;
+            }
 
             const times = await buildEventTimes(
               googleToken, calendarId, parsedStart, parsedEnd, params.timeZone, (params.recurrence?.length ?? 0) > 0,
@@ -849,6 +1103,7 @@ export class GoogleCalendarTools {
             const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/${encodedCalendarId}/events`);
             url.searchParams.set('sendUpdates', sendUpdates);
             if (event.conferenceData) url.searchParams.set('conferenceDataVersion', '1');
+            if (event.attachments) url.searchParams.set('supportsAttachments', 'true');
 
             const res = await googleFetch(url.toString(), {
               method: 'POST',
@@ -860,11 +1115,14 @@ export class GoogleCalendarTools {
               body: JSON.stringify(event),
             });
             if (!res.ok) {
-              return errorResult(mapGoogleError(res, {
-                operation: "create calendar event",
-                resource: "calendar",
-                resourceId: calendarId,
-              }));
+              return errorResult({
+                ...mapGoogleError(res, {
+                  operation: "create calendar event",
+                  resource: "calendar",
+                  resourceId: calendarId,
+                }),
+                ...(res.status === 400 && eventTypeHint(eventType)),
+              });
             }
 
             const createdEvent = (res.bodyJson as CalendarEvent) || ({} as CalendarEvent);
@@ -886,12 +1144,13 @@ export class GoogleCalendarTools {
         description:
           "Patch fields on an existing Google Calendar event by `eventId`. " +
           "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
-          "To reschedule, pass BOTH `start` and `end` as ISO 8601 — both date-only (all-day) or both datetime (timed). Pass neither to leave the schedule unchanged. " +
+          "To reschedule, pass `start` and/or `end` as ISO 8601 — date-only for all-day, datetime for timed. With only `start`, the event moves and keeps its duration; with only `end`, just the end changes. Pass neither to leave the schedule unchanged; pass both to change the kind (timed <-> all-day). " +
           "`description` is rendered through Markdown to HTML by the server. " +
           "To add or remove guests, use `addAttendees` / `removeAttendees`: everyone else keeps their current response. " +
           "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead — it preserves everyone else's responses. " +
-          "Optional extras: `recurrence`, `addGoogleMeet`, `colorId`, `visibility`, `availability` (busy/free) and `reminders`. " +
-          "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
+          "Optional extras: `recurrence`, `addGoogleMeet`, `colorId`, `visibility`, `availability` (busy/free), `reminders` and `guestPermissions`. " +
+          "Drive attachments: `addAttachments` / `removeAttachments` edit the list incrementally; `attachments` REPLACES it (pass [] to remove all). " +
+          "Cannot move an event between calendars or change its `eventType`. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
         destructiveHint: true,
         outputSchema: eventSchema.shape,
         schema: {
@@ -908,13 +1167,13 @@ export class GoogleCalendarTools {
             .string()
             .optional()
             .describe(
-              'New start as ISO 8601 — date-only for all-day, datetime for timed. Must be paired with `end` of the same kind. Omit to leave the schedule unchanged.'
+              'New start as ISO 8601 — date-only for all-day, datetime for timed. Alone, moves the event keeping its current duration. Omit to leave the start unchanged.'
             ),
           end: z
             .string()
             .optional()
             .describe(
-              'New end as ISO 8601, same kind as `start`. Required if `start` is provided.'
+              'New end as ISO 8601. Alone, changes only the end (must stay after the start). With `start`, both must be the same kind.'
             ),
           timeZone: inputTimeZoneSchema,
           attendees: z
@@ -934,6 +1193,9 @@ export class GoogleCalendarTools {
             .optional()
             .default('all')
             .describe('Notification behaviour. all / externalOnly / none.'),
+          attachments: z.array(attachmentInputSchema).optional().describe('REPLACES the attachment list. Pass [] to remove every attachment. Prefer addAttachments / removeAttachments for incremental changes.'),
+          addAttachments: z.array(attachmentInputSchema).optional().describe('Drive files to attach, keeping the existing ones. Cannot be combined with `attachments`.'),
+          removeAttachments: z.array(z.string()).optional().describe('Attachments to drop, each a Drive file id or the stored fileUrl. Cannot be combined with `attachments`.'),
           ...eventOptionsInputSchema,
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.events", async (params: any, context: any) => {
@@ -941,10 +1203,12 @@ export class GoogleCalendarTools {
             const googleToken = context.accessToken;
             const {
               calendarId, eventId, summary, description, location,
-              start, end, attendees, addAttendees, removeAttendees, sendUpdates
+              start, end, attendees, addAttendees, removeAttendees, sendUpdates,
+              attachments, addAttachments, removeAttachments,
             } = params;
 
-            const updates: any = buildEventOptions(params as EventOptions);
+            const updates: any = eventOptionsOrError(params as EventOptions);
+            if ('isError' in updates) return updates;
             if (summary !== undefined) updates.summary = summary;
             if (description !== undefined) updates.description = md.render(description);
             if (location !== undefined) updates.location = location;
@@ -956,24 +1220,25 @@ export class GoogleCalendarTools {
               });
             }
 
-            const hasStart = start !== undefined;
-            const hasEnd = end !== undefined;
-
-            if (hasStart !== hasEnd) {
+            const incrementalAttachments = addAttachments !== undefined || removeAttachments !== undefined;
+            if (incrementalAttachments && attachments !== undefined) {
               return errorResult({
-                error: "To reschedule, provide BOTH `start` and `end`. To leave the schedule unchanged, omit BOTH.",
+                error: "Pass either `attachments` (full replacement) or `addAttachments` / `removeAttachments` (incremental), not both.",
               });
             }
 
-            if (hasStart && hasEnd) {
-              const parsedStart = parseIso(start);
-              const parsedEnd = parseIso(end);
-              if (!parsedStart) {
-                return errorResult({ error: `Invalid \`start\` "${start}". Expected ISO 8601.` });
-              }
-              if (!parsedEnd) {
-                return errorResult({ error: `Invalid \`end\` "${end}". Expected ISO 8601.` });
-              }
+            const hasStart = start !== undefined;
+            const hasEnd = end !== undefined;
+            const parsedStart = hasStart ? parseIso(start) : null;
+            const parsedEnd = hasEnd ? parseIso(end) : null;
+            if (hasStart && !parsedStart) {
+              return errorResult({ error: `Invalid \`start\` "${start}". Expected ISO 8601.` });
+            }
+            if (hasEnd && !parsedEnd) {
+              return errorResult({ error: `Invalid \`end\` "${end}". Expected ISO 8601.` });
+            }
+
+            if (parsedStart && parsedEnd) {
               if (parsedStart.kind !== parsedEnd.kind) {
                 return errorResult({
                   error: "`start` and `end` must be the same kind (both date-only or both datetime).",
@@ -995,18 +1260,42 @@ export class GoogleCalendarTools {
             // Google requires a named zone on recurring timed events, so turning an
             // existing offset-only event into a series re-sends its times with one
             const makingRecurring = (params.recurrence?.length ?? 0) > 0 && !hasStart;
+            const oneBound = hasStart !== hasEnd;
             let current: CalendarEvent | undefined;
-            if (incremental || makingRecurring) {
+            if (incremental || makingRecurring || oneBound || incrementalAttachments) {
               const loaded = await fetchEvent(googleToken, calendarId, eventId, "load event before updating");
               if ('isError' in loaded) return loaded;
               current = loaded;
             }
 
+            if (current && oneBound) {
+              const times = parsedStart
+                ? await buildShiftedTimes(googleToken, calendarId, current, parsedStart, params.timeZone)
+                : await buildEndOnly(googleToken, calendarId, current, parsedEnd!, params.timeZone);
+              if ('isError' in times) return times;
+              Object.assign(updates, times);
+            }
+
+            if (attachments !== undefined) {
+              const replacement = attachmentsOrError(attachments);
+              if ('isError' in replacement) return replacement;
+              updates.attachments = replacement;
+            } else if (current && incrementalAttachments) {
+              const added = attachmentsOrError(addAttachments ?? []);
+              if ('isError' in added) return added;
+              try {
+                updates.attachments = mergeAttachments(current.attachments, added, removeAttachments ?? []);
+              } catch (err: any) {
+                return errorResult({ error: err?.message || String(err), resource: "event", resourceId: eventId });
+              }
+            }
+            if (updates.attachments) url.searchParams.set('supportsAttachments', 'true');
+
             if (makingRecurring && current?.start?.dateTime && current.end?.dateTime && !current.start.timeZone) {
               const tz = params.timeZone ?? await fetchCalendarTimeZone(googleToken, calendarId);
               if (typeof tz !== 'string') return tz;
               updates.start = { dateTime: current.start.dateTime, timeZone: tz };
-              updates.end = { dateTime: current.end.dateTime, timeZone: tz };
+              updates.end = { dateTime: updates.end?.dateTime ?? current.end.dateTime, timeZone: tz };
             }
 
             let ifMatch: string | undefined;
@@ -1025,7 +1314,11 @@ export class GoogleCalendarTools {
                 normalizeAttendees(addAttendees) || [],
                 removeAttendees || [],
               );
-              if (typeof current.etag === 'string' && current.etag.length > 0) ifMatch = current.etag;
+            }
+            // Every read-then-patch path derives the patch from what it read, so
+            // a concurrent edit in between must fail rather than be overwritten
+            if (current && typeof current.etag === 'string' && current.etag.length > 0) {
+              ifMatch = current.etag;
             }
 
             const res = await googleFetch(url.toString(), {
@@ -1040,7 +1333,7 @@ export class GoogleCalendarTools {
             });
             if (!res.ok && res.status === 412) {
               return errorResult({
-                error: `Event "${eventId}" was changed by someone else between reading its guest list and updating it, so nothing was saved. Try again.`,
+                error: `Event "${eventId}" was changed by someone else between reading it and updating it, so nothing was saved. Try again.`,
                 resource: "event",
                 resourceId: eventId,
               });

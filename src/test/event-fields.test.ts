@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildEventOptions, mergeAttendees, type AttendeeLike } from '../lib/event-fields.js';
+import { buildEventOptions, mergeAttachments, mergeAttendees, normalizeAttachments, type AttendeeLike } from '../lib/event-fields.js';
 
 describe('buildEventOptions', () => {
   it('returns an empty body when no option is set', () => {
@@ -76,5 +76,128 @@ describe('mergeAttendees', () => {
 
   it('tolerates a missing attendee list', () => {
     expect(mergeAttendees(undefined, [{ email: 'x@example.com' }], [])).toEqual([{ email: 'x@example.com' }]);
+  });
+});
+
+describe('buildEventOptions guest permissions and event types', () => {
+  it('maps guest permissions onto the three Google flags', () => {
+    expect(buildEventOptions({
+      guestPermissions: { canModify: true, canInviteOthers: false, canSeeOtherGuests: false },
+    })).toEqual({ guestsCanModify: true, guestsCanInviteOthers: false, guestsCanSeeOtherGuests: false });
+    expect(buildEventOptions({ guestPermissions: { canInviteOthers: true } })).toEqual({ guestsCanInviteOthers: true });
+  });
+
+  it('builds an out-of-office event with its decline settings', () => {
+    expect(buildEventOptions({
+      eventType: 'outOfOffice',
+      outOfOffice: { autoDeclineMode: 'declineAllConflictingInvitations', declineMessage: 'Away' },
+    })).toEqual({
+      eventType: 'outOfOffice',
+      outOfOfficeProperties: { autoDeclineMode: 'declineAllConflictingInvitations', declineMessage: 'Away' },
+    });
+    expect(buildEventOptions({ eventType: 'outOfOffice' })).toEqual({
+      eventType: 'outOfOffice',
+      outOfOfficeProperties: { autoDeclineMode: 'declineAllConflictingInvitations' },
+    });
+  });
+
+  it('builds a focus-time event with chat status and decline settings', () => {
+    expect(buildEventOptions({
+      eventType: 'focusTime',
+      focusTime: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
+    })).toEqual({
+      eventType: 'focusTime',
+      focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
+    });
+    expect(buildEventOptions({ eventType: 'focusTime' })).toEqual({
+      eventType: 'focusTime',
+      focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
+    });
+  });
+
+  it('builds the three working-location shapes, public and free as Google requires', () => {
+    expect(buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'homeOffice' } })).toEqual({
+      eventType: 'workingLocation',
+      visibility: 'public',
+      transparency: 'transparent',
+      workingLocationProperties: { type: 'homeOffice', homeOffice: {} },
+    });
+    expect(buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation', label: 'Cafe' } })).toMatchObject({
+      workingLocationProperties: { type: 'customLocation', customLocation: { label: 'Cafe' } },
+    });
+    expect(buildEventOptions({
+      eventType: 'workingLocation',
+      workingLocation: { type: 'officeLocation', label: 'HQ', buildingId: 'b1', floorId: '3', deskId: 'd7' },
+    })).toMatchObject({
+      workingLocationProperties: { type: 'officeLocation', officeLocation: { label: 'HQ', buildingId: 'b1', floorId: '3', deskId: 'd7' } },
+    });
+  });
+
+  it('refuses to make a working location private or busy', () => {
+    expect(() => buildEventOptions({ eventType: 'workingLocation', visibility: 'private' })).toThrow(/public/);
+    expect(() => buildEventOptions({ eventType: 'workingLocation', availability: 'busy' })).toThrow(/free/);
+  });
+
+  it('requires a label for a custom working location and defaults to home office', () => {
+    expect(() => buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation' } })).toThrow(/label/);
+    expect(buildEventOptions({ eventType: 'workingLocation' })).toMatchObject({
+      workingLocationProperties: { type: 'homeOffice', homeOffice: {} },
+    });
+  });
+
+  it('infers the event type from the settings given, and rejects settings for another type', () => {
+    expect(buildEventOptions({ focusTime: { chatStatus: 'available' } })).toEqual({
+      eventType: 'focusTime',
+      focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'available' },
+    });
+    expect(() => buildEventOptions({ eventType: 'default', focusTime: { chatStatus: 'available' } })).toThrow(/focusTime/);
+    expect(() => buildEventOptions({ outOfOffice: {}, workingLocation: {} })).toThrow(/one event type/);
+  });
+});
+
+describe('normalizeAttachments', () => {
+  it('accepts Drive URLs as given and turns bare file ids into open links', () => {
+    expect(normalizeAttachments([
+      'https://docs.google.com/document/d/1abcDEF_-xyz/edit',
+      '1abcDEF_-xyz',
+      { fileUrl: 'https://drive.google.com/file/d/1abc/view', title: 'Deck' },
+      { fileId: '1xyz', title: 'Notes' },
+    ])).toEqual([
+      { fileUrl: 'https://docs.google.com/document/d/1abcDEF_-xyz/edit' },
+      { fileUrl: 'https://drive.google.com/open?id=1abcDEF_-xyz' },
+      { fileUrl: 'https://drive.google.com/file/d/1abc/view', title: 'Deck' },
+      { fileUrl: 'https://drive.google.com/open?id=1xyz', title: 'Notes' },
+    ]);
+  });
+
+  it('rejects anything that is neither a URL nor a Drive file id', () => {
+    expect(() => normalizeAttachments(['not a file'])).toThrow(/Drive/);
+  });
+});
+
+describe('mergeAttachments', () => {
+  const existing = [
+    { fileUrl: 'https://drive.google.com/open?id=1keep', fileId: '1keep', title: 'Keep' },
+    { fileUrl: 'https://docs.google.com/document/d/1gone/edit', fileId: '1gone', title: 'Gone' },
+  ];
+
+  it('removes by file id or url and appends new ones without duplicating', () => {
+    expect(mergeAttachments(existing, [
+      { fileUrl: 'https://drive.google.com/open?id=1keep' },
+      { fileUrl: 'https://drive.google.com/open?id=1new' },
+    ], ['1gone'])).toEqual([existing[0], { fileUrl: 'https://drive.google.com/open?id=1new' }]);
+    expect(mergeAttachments(existing, [], ['https://docs.google.com/document/d/1gone/edit'])).toEqual([existing[0]]);
+  });
+
+  it('refuses to grow past the 25 attachments Google allows', () => {
+    const many = Array.from({ length: 25 }, (_, i) => ({ fileUrl: `https://drive.google.com/open?id=file${i}` }));
+    expect(() => mergeAttachments(many, [{ fileUrl: 'https://drive.google.com/open?id=one-more' }], [])).toThrow(/25/);
+    expect(mergeAttachments(many, [{ fileUrl: 'https://drive.google.com/open?id=one-more' }], ['file0'])).toHaveLength(25);
+  });
+
+  it('tolerates an event with no attachments', () => {
+    expect(mergeAttachments(undefined, [{ fileUrl: 'https://drive.google.com/open?id=1a' }], [])).toEqual([
+      { fileUrl: 'https://drive.google.com/open?id=1a' },
+    ]);
   });
 });

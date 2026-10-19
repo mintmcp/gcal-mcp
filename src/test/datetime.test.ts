@@ -114,6 +114,17 @@ describe("attachOffsetForTimezone", () => {
     );
   });
 
+  it("moves a nonexistent local time in a spring-forward gap one hour later, like the Calendar UI", () => {
+    // 02:30 does not exist on 2026-03-08 in LA; the clock jumps 02:00 -> 03:00.
+    // Shifting forward lands on 03:30 PDT, the same instant as 02:30 PST.
+    expect(attachOffsetForTimezone("2026-03-08T02:30:00", "America/Los_Angeles")).toBe(
+      "2026-03-08T02:30:00-08:00",
+    );
+    expect(attachOffsetForTimezone("2026-03-29T01:30:00", "Europe/London")).toBe(
+      "2026-03-29T01:30:00+00:00",
+    );
+  });
+
   it("appends BST for Europe/London in summer", () => {
     expect(attachOffsetForTimezone("2024-06-15T12:00:00", "Europe/London")).toBe(
       "2024-06-15T12:00:00+01:00",
@@ -354,5 +365,19 @@ describe("isSlotBusy", () => {
         busy,
       ),
     ).toBe(true);
+  });
+});
+
+describe("normalizeAttendees extras", () => {
+  it("keeps additionalGuests, resource and responseStatus when given", () => {
+    expect(normalizeAttendees([
+      { email: "room@example.com", resource: true },
+      { email: "a@example.com", additionalGuests: 2, responseStatus: "accepted" },
+      { email: "b@example.com", additionalGuests: 0, resource: false },
+    ])).toEqual([
+      { email: "room@example.com", resource: true },
+      { email: "a@example.com", additionalGuests: 2, responseStatus: "accepted" },
+      { email: "b@example.com" },
+    ]);
   });
 });

@@ -72,7 +72,7 @@ describe('get_calendar_events', () => {
   it('keeps the page token when Google returns an empty page with more results behind it', async () => {
     enqueue({ items: [], nextPageToken: 'next' });
     const res = await run('get_calendar_events', { q: 'offsite' });
-    expect(res.structuredContent.nextPageToken).toBe('next');
+    expect(res.structuredContent.nextPageToken).toMatch(/^gcalmin1\./);
     expect(res.structuredContent.message).toContain('pageToken');
   });
 
@@ -392,5 +392,258 @@ describe('get_next_availability', () => {
     });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('bob@example.com');
+  });
+});
+
+describe('get_calendar_events filters and ordering', () => {
+  it('forwards event type filters, showDeleted and ordering by last update', async () => {
+    enqueue({ items: [] });
+    await run('get_calendar_events', { eventTypes: ['outOfOffice', 'focusTime'], showDeleted: true, orderBy: 'updated', timeMin: '2026-10-20T00:00:00Z' });
+    const p = calls[0].url.searchParams;
+    expect(p.getAll('eventTypes')).toEqual(['outOfOffice', 'focusTime']);
+    expect(p.get('showDeleted')).toBe('true');
+    expect(p.get('orderBy')).toBe('updated');
+    expect(p.get('singleEvents')).toBe('true');
+  });
+
+  it('orders by start time and leaves the other filters off by default', async () => {
+    enqueue({ items: [] });
+    await run('get_calendar_events', { timeMin: '2026-10-20T00:00:00Z' });
+    const p = calls[0].url.searchParams;
+    expect(p.get('orderBy')).toBe('startTime');
+    expect(p.has('eventTypes')).toBe(false);
+    expect(p.has('showDeleted')).toBe(false);
+  });
+
+  it('returns series masters instead of instances when asked not to expand recurring events', async () => {
+    enqueue({ items: [] });
+    await run('get_calendar_events', { expandRecurring: false, timeMin: '2026-10-20T00:00:00Z' });
+    const p = calls[0].url.searchParams;
+    expect(p.get('singleEvents')).toBe('false');
+    expect(p.has('orderBy')).toBe(false);
+  });
+
+  it('refuses start-time ordering of unexpanded series, which Google cannot do', async () => {
+    const res = await run('get_calendar_events', { expandRecurring: false, orderBy: 'startTime' });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('exposes attachments, guest permissions and event type settings in the output', async () => {
+    enqueue({
+      items: [{
+        ...eventBody,
+        attachments: [{ fileUrl: 'https://drive.google.com/open?id=1a', title: 'Deck', mimeType: 'application/pdf', fileId: '1a', iconLink: 'x' }],
+        guestsCanModify: true,
+        guestsCanInviteOthers: false,
+        eventType: 'focusTime',
+        focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
+      }],
+    });
+    const res = await run('get_calendar_events', { timeMin: '2026-10-20T00:00:00Z' });
+    const ev = res.structuredContent.events[0];
+    expect(ev.attachments).toEqual([{ fileUrl: 'https://drive.google.com/open?id=1a', title: 'Deck', mimeType: 'application/pdf', fileId: '1a' }]);
+    expect(ev.guestPermissions).toEqual({ canModify: true, canInviteOthers: false });
+    expect(ev.focusTime).toEqual({ autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' });
+  });
+});
+
+describe('get_calendar_events pagination with a defaulted lower bound', () => {
+  it('freezes the implicit "now" in the page token so the next page continues from the same bound', async () => {
+    enqueue({ items: [eventBody], nextPageToken: 'g-token' });
+    const first = await run('get_calendar_events', { q: 'sync' });
+    const frozenMin = calls[0].url.searchParams.get('timeMin');
+    const token = first.structuredContent.nextPageToken;
+    expect(token).not.toBe('g-token');
+
+    enqueue({ items: [] });
+    await run('get_calendar_events', { q: 'sync', pageToken: token });
+    expect(calls[1].url.searchParams.get('pageToken')).toBe('g-token');
+    expect(calls[1].url.searchParams.get('timeMin')).toBe(frozenMin);
+  });
+
+  it('passes Google tokens through untouched when the caller set the bound explicitly', async () => {
+    enqueue({ items: [eventBody], nextPageToken: 'g-token' });
+    const res = await run('get_calendar_events', { timeMin: '2026-10-20T00:00:00Z' });
+    expect(res.structuredContent.nextPageToken).toBe('g-token');
+  });
+
+  it('rejects a frozen token combined with an explicit timeMin, since Google needs identical bounds per page', async () => {
+    enqueue({ items: [eventBody], nextPageToken: 'g-token' });
+    const first = await run('get_calendar_events', {});
+    const res = await run('get_calendar_events', { pageToken: first.structuredContent.nextPageToken, timeMin: '2026-10-20T00:00:00Z' });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('create_event attachments, event types and guest permissions', () => {
+  it('sends attachments and tells Google the client supports them', async () => {
+    enqueue(eventBody);
+    await run('create_event', {
+      summary: 'Sync', start: '2026-10-20T10:00:00Z', end: '2026-10-20T10:30:00Z',
+      attachments: ['1abcdefghij', { fileUrl: 'https://docs.google.com/document/d/1x/edit', title: 'Notes' }],
+    });
+    expect(calls[0].url.searchParams.get('supportsAttachments')).toBe('true');
+    expect(calls[0].body.attachments).toEqual([
+      { fileUrl: 'https://drive.google.com/open?id=1abcdefghij' },
+      { fileUrl: 'https://docs.google.com/document/d/1x/edit', title: 'Notes' },
+    ]);
+  });
+
+  it('rejects a malformed attachment before calling Google', async () => {
+    const res = await run('create_event', { summary: 'S', start: '2026-10-20', end: '2026-10-21', attachments: ['no good'] });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('creates an out-of-office event and names the type when Google rejects it', async () => {
+    enqueue({ error: { message: 'Out of office events must be created on the primary calendar' } }, 400);
+    const res = await run('create_event', {
+      calendarId: 'team@example.com', summary: 'OOO', start: '2026-10-20T10:00:00Z', end: '2026-10-20T18:00:00Z',
+      eventType: 'outOfOffice', outOfOffice: { declineMessage: 'Back Monday' },
+    });
+    expect(calls[0].body).toMatchObject({
+      eventType: 'outOfOffice',
+      outOfOfficeProperties: { autoDeclineMode: 'declineAllConflictingInvitations', declineMessage: 'Back Monday' },
+    });
+    expect(res.isError).toBe(true);
+    const err = JSON.parse(res.content[0].text);
+    expect(err.eventType).toBe('outOfOffice');
+    expect(err.error).toMatch(/primary calendar/);
+  });
+
+  it('refuses a multi-day all-day working location up front', async () => {
+    const res = await run('create_event', { summary: 'WFH', start: '2026-10-20', end: '2026-10-22', eventType: 'workingLocation' });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    enqueue(eventBody);
+    await run('create_event', { summary: 'WFH', start: '2026-10-20', end: '2026-10-21', eventType: 'workingLocation' });
+    expect(calls[0].body).toMatchObject({ eventType: 'workingLocation', visibility: 'public', transparency: 'transparent' });
+  });
+
+  it('exposes birthday details in the output', async () => {
+    enqueue({ items: [{ ...eventBody, eventType: 'birthday', birthdayProperties: { type: 'birthday', contact: 'people/c1' } }] });
+    const res = await run('get_calendar_events', { timeMin: '2026-10-20T00:00:00Z', eventTypes: ['birthday'] });
+    expect(res.structuredContent.events[0].birthday).toEqual({ type: 'birthday', contact: 'people/c1' });
+  });
+
+  it('refuses an all-day out-of-office or focus-time event up front', async () => {
+    const res = await run('create_event', { summary: 'Focus', start: '2026-10-20', end: '2026-10-21', eventType: 'focusTime' });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sends guest permissions and attendee extras', async () => {
+    enqueue({ ...eventBody, attendees: [{ email: 'room@example.com', resource: true, responseStatus: 'accepted' }, { email: 'a@example.com', additionalGuests: 2 }] });
+    const res = await run('create_event', {
+      summary: 'Sync', start: '2026-10-20T10:00:00Z', end: '2026-10-20T10:30:00Z',
+      guestPermissions: { canModify: true, canSeeOtherGuests: false },
+      attendees: [{ email: 'room@example.com', resource: true }, { email: 'a@example.com', additionalGuests: 2 }],
+      sendUpdates: 'none',
+    });
+    expect(calls[0].body).toMatchObject({ guestsCanModify: true, guestsCanSeeOtherGuests: false });
+    expect(calls[0].body.attendees).toEqual([{ email: 'room@example.com', resource: true }, { email: 'a@example.com', additionalGuests: 2 }]);
+    expect(res.structuredContent.attendees).toEqual([
+      { email: 'room@example.com', responseStatus: 'accepted', resource: true },
+      { email: 'a@example.com', responseStatus: null, additionalGuests: 2 },
+    ]);
+  });
+
+  it('rejects settings for a different event type before calling Google', async () => {
+    const res = await run('create_event', { summary: 'S', start: '2026-10-20T10:00:00Z', end: '2026-10-20T10:30:00Z', eventType: 'outOfOffice', focusTime: {} });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('update_event reschedule with one bound', () => {
+  it('moves the start and keeps the duration when only a new start is given, guarded by the etag it read', async () => {
+    enqueue({ ...eventBody, etag: '"e9"' });
+    enqueue(calendarBody);
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', start: '2026-10-22T15:00:00' });
+    expect(calls.map(c => c.method)).toEqual(['GET', 'GET', 'PATCH']);
+    expect(calls[2].headers['If-Match']).toBe('"e9"');
+    expect(calls[2].body.start).toEqual({ dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' });
+    expect(calls[2].body.end).toEqual({ dateTime: '2026-10-22T15:30:00', timeZone: 'America/Recife' });
+  });
+
+  it('keeps a new end when making an offset-only event recurring in the same call', async () => {
+    enqueue({ ...eventBody });
+    enqueue(calendarBody);
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', end: '2026-10-20T11:00:00-03:00', recurrence: ['RRULE:FREQ=WEEKLY'] });
+    expect(calls[2].body.start).toEqual({ dateTime: '2026-10-20T10:00:00-03:00', timeZone: 'America/Recife' });
+    expect(calls[2].body.end).toEqual({ dateTime: '2026-10-20T11:00:00-03:00', timeZone: 'America/Recife' });
+  });
+
+  it('uses the zone the event already stores for a start-only move', async () => {
+    enqueue({ ...eventBody, start: { ...eventBody.start, timeZone: 'Europe/Lisbon' }, end: { ...eventBody.end, timeZone: 'Europe/Lisbon' } });
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', start: '2026-10-22T15:00:00-03:00' });
+    expect(calls.map(c => c.method)).toEqual(['GET', 'PATCH']);
+    expect(calls[1].body.start).toEqual({ dateTime: '2026-10-22T15:00:00-03:00', timeZone: 'Europe/Lisbon' });
+    expect(calls[1].body.end).toEqual({ dateTime: '2026-10-22T19:30:00', timeZone: 'Europe/Lisbon' });
+  });
+
+  it('shifts an all-day event by whole days when only a new start date is given', async () => {
+    enqueue({ ...eventBody, start: { date: '2026-10-20' }, end: { date: '2026-10-22' } });
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', start: '2026-11-01' });
+    expect(calls[1].body.start).toEqual({ date: '2026-11-01' });
+    expect(calls[1].body.end).toEqual({ date: '2026-11-03' });
+  });
+
+  it('changes only the end when only a new end is given', async () => {
+    enqueue({ ...eventBody });
+    enqueue(calendarBody);
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', end: '2026-10-20T11:00:00' });
+    expect(calls[2].body).not.toHaveProperty('start');
+    expect(calls[2].body.end).toEqual({ dateTime: '2026-10-20T11:00:00', timeZone: 'America/Recife' });
+  });
+
+  it('refuses to turn a timed event all-day with a lone start date', async () => {
+    enqueue({ ...eventBody });
+    const res = await run('update_event', { eventId: 'ev1', start: '2026-11-01' });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('update_event attachments', () => {
+  it('adds and removes attachments without touching the rest', async () => {
+    enqueue({
+      ...eventBody,
+      etag: '"e1"',
+      attachments: [
+        { fileUrl: 'https://drive.google.com/open?id=1keep', fileId: '1keep', title: 'Keep', mimeType: 'text/plain' },
+        { fileUrl: 'https://drive.google.com/open?id=1gone', fileId: '1gone', title: 'Gone' },
+      ],
+    });
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', addAttachments: ['1newfile'], removeAttachments: ['1gone'] });
+    expect(calls[1].method).toBe('PATCH');
+    expect(calls[1].url.searchParams.get('supportsAttachments')).toBe('true');
+    expect(calls[1].headers['If-Match']).toBe('"e1"');
+    expect(calls[1].body.attachments).toEqual([
+      { fileUrl: 'https://drive.google.com/open?id=1keep', fileId: '1keep', title: 'Keep', mimeType: 'text/plain' },
+      { fileUrl: 'https://drive.google.com/open?id=1newfile' },
+    ]);
+  });
+
+  it('replaces the whole attachment list when `attachments` is given', async () => {
+    enqueue(eventBody);
+    await run('update_event', { eventId: 'ev1', attachments: [] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.attachments).toEqual([]);
+    expect(calls[0].url.searchParams.get('supportsAttachments')).toBe('true');
+  });
+
+  it('rejects mixing a full attachment replacement with incremental changes', async () => {
+    const res = await run('update_event', { eventId: 'ev1', attachments: [], addAttachments: ['1a'] });
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
   });
 });

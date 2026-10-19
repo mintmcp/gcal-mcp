@@ -88,7 +88,24 @@ export function attachOffsetForTimezone(naiveIso: string, timeZone: string): str
   // yields the offset actually in force at the requested local time
   const nearby = getOffset(timeZone, new Date(`${naiveIso}Z`));
   const offset = getOffset(timeZone, new Date(`${naiveIso}${nearby}`));
-  return `${naiveIso}${offset}`;
+  if (offset === nearby || wallClockMatches(naiveIso, offset, timeZone)) return `${naiveIso}${offset}`;
+  // The wall-clock time does not exist (spring-forward gap). Using the
+  // pre-transition offset lands one hour later on the clock, which is what
+  // the Google Calendar UI does with such times
+  const preTransition = offsetMinutes(offset) < offsetMinutes(nearby) ? offset : nearby;
+  return `${naiveIso}${preTransition}`;
+}
+
+function offsetMinutes(offset: string): number {
+  if (offset === "Z") return 0;
+  const sign = offset.startsWith("-") ? -1 : 1;
+  const [h, m] = offset.slice(1).split(":").map(Number);
+  return sign * (h * 60 + m);
+}
+
+function wallClockMatches(naiveIso: string, offset: string, timeZone: string): boolean {
+  const local = toLocalISO(new Date(`${naiveIso}${offset}`), timeZone);
+  return local.startsWith(naiveIso.slice(0, 19));
 }
 
 /**
@@ -164,25 +181,34 @@ export function formatDateTimeWithDay(eventDateTime: {
 
 /**
  * Normalise a heterogeneous attendee input array (bare emails or
- * `{ email, displayName?, optional? }` objects) into the shape Google
- * Calendar expects. Drops empty `displayName`s and only sets `optional`
- * when explicitly true.
+ * `{ email, displayName?, optional?, ... }` objects) into the shape Google
+ * Calendar expects. Drops empty `displayName`s and only sets the boolean
+ * flags when explicitly true.
  */
+export interface AttendeeInput {
+  email: string;
+  displayName?: string;
+  optional?: boolean;
+  additionalGuests?: number;
+  resource?: boolean;
+  responseStatus?: string;
+  [key: string]: unknown;
+}
+
 export function normalizeAttendees(
-  input:
-    | Array<string | { email: string; displayName?: string; optional?: boolean }>
-    | undefined,
-): Array<{ email: string; displayName?: string; optional?: boolean }> | undefined {
+  input: Array<string | AttendeeInput> | undefined,
+): AttendeeInput[] | undefined {
   if (!input) return undefined;
   return input.map((a) => {
     if (typeof a === "string") return { email: a };
-    const out: { email: string; displayName?: string; optional?: boolean } = {
-      email: a.email,
-    };
+    const out: AttendeeInput = { email: a.email };
     if (typeof a.displayName === "string" && a.displayName.length > 0) {
       out.displayName = a.displayName;
     }
     if (a.optional === true) out.optional = true;
+    if (typeof a.additionalGuests === "number" && a.additionalGuests > 0) out.additionalGuests = a.additionalGuests;
+    if (a.resource === true) out.resource = true;
+    if (typeof a.responseStatus === "string") out.responseStatus = a.responseStatus;
     return out;
   });
 }
