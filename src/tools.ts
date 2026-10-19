@@ -403,7 +403,7 @@ async function fetchCalendarTimeZone(googleToken: string, calendarId: string): P
   });
   if (!res.ok) {
     return errorResult(mapGoogleError(res, {
-      operation: "read the calendar time zone (pass `timeZone` explicitly to skip this lookup)",
+      operation: "read the calendar time zone (pass a time zone explicitly to skip this lookup)",
       resource: "calendar",
       resourceId: calendarId,
     }));
@@ -566,7 +566,7 @@ export class GoogleCalendarTools {
           "Time inputs accept full ISO 8601 strings: 'YYYY-MM-DD' (treated as start of that day in `timeZone`), naive 'YYYY-MM-DDTHH:MM[:SS]' (combined with `timeZone`), or zone-aware '...Z' / '...±HH:MM'. " +
           "Without `timeMax`, returns the next `maxResults` events from `timeMin` onwards. " +
           "For a single calendar day, set `timeMin='2024-01-15'` and `timeMax='2024-01-16'` (end is EXCLUSIVE). " +
-          "Pass `q` to search by keyword (matches title, description, location, attendee names/emails); with `q` and no `timeMin`, the WHOLE calendar is searched, past included. " +
+          "Pass `q` to search by keyword (matches title, description, location, attendee names/emails); like any listing it starts at `timeMin` (default NOW) and runs oldest first, so pass an earlier `timeMin` only when the user asks about past events. " +
           "Response times are formatted in `timeZone` when given, otherwise in the calendar's own time zone. " +
           "If `nextPageToken` is returned, more events match — pass it back as `pageToken` together with the SAME `q`, time bounds and calendarId to continue. " +
           "Recurring events are returned as expanded instances; each `id` (which may contain a date suffix) targets that single occurrence in update_event/delete_event. " +
@@ -603,8 +603,10 @@ export class GoogleCalendarTools {
             .describe('IANA timezone (e.g. "America/Los_Angeles") used to interpret naive/date-only inputs and to format response times. Defaults to the calendar\'s own time zone.'),
           q: z
             .string()
+            .trim()
+            .min(1)
             .optional()
-            .describe('Free-text search. Case-insensitive; matches title, description, location and attendee names/emails. Without `timeMin`, searches the whole calendar including the past.'),
+            .describe('Free-text search. Case-insensitive; matches title, description, location and attendee names/emails. Searches from `timeMin` (default NOW); pass an earlier `timeMin` to include past events.'),
           pageToken: z.string().optional().describe('Pagination token from a prior call\'s `nextPageToken`. Pass it back to fetch the next page.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/calendar.readonly", async ({ calendarId, maxResults, timeMin, timeMax, timeZone, q, pageToken }: any, context: any) => {
@@ -641,11 +643,12 @@ export class GoogleCalendarTools {
                 ? attachOffsetForTimezone(`${p.date}T00:00:00`, tz)
                 : p.hasOffset ? p.rfc3339 : attachOffsetForTimezone(p.rfc3339, tz);
 
-            // A keyword search with no lower bound covers the whole calendar;
-            // otherwise the default lower bound is now
+            // Keyword searches keep the default of now too: Google can only order
+            // by start time ascending, so an unbounded search would surface the
+            // oldest matches first and hide the upcoming ones
             if (parsedMin) {
               url.searchParams.set('timeMin', toRfc3339(parsedMin));
-            } else if (!q) {
+            } else {
               url.searchParams.set('timeMin', new Date().toISOString());
             }
             if (parsedMax) url.searchParams.set('timeMax', toRfc3339(parsedMax));
@@ -666,13 +669,17 @@ export class GoogleCalendarTools {
 
             const data = (res.bodyJson as EventsListResponse) || { items: [] };
             const events = data.items || [];
+            const nextPageToken = data.nextPageToken || null;
 
+            // Google may return an empty page that still has more matches behind it
             if (events.length === 0) {
               return okResult({
                 calendarId,
                 events: [] as any[],
-                nextPageToken: null,
-                message: `No events found in calendar "${calendarId}" for the specified time range`
+                nextPageToken,
+                message: nextPageToken
+                  ? `No events on this page, but more may match. Pass \`nextPageToken\` back as \`pageToken\` to continue.`
+                  : `No events found in calendar "${calendarId}" for the requested range`
               });
             }
 
@@ -687,7 +694,7 @@ export class GoogleCalendarTools {
             return okResult({
               calendarId,
               events: structuredEvents,
-              nextPageToken: data.nextPageToken || null
+              nextPageToken
             });
           } catch (error: any) {
             return errorResult({ error: `Unexpected error in get_calendar_events: ${error?.message || String(error)}` });
@@ -885,6 +892,7 @@ export class GoogleCalendarTools {
           "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead — it preserves everyone else's responses. " +
           "Optional extras: `recurrence`, `addGoogleMeet`, `colorId`, `visibility`, `availability` (busy/free) and `reminders`. " +
           "Cannot move an event between calendars. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
+        destructiveHint: true,
         outputSchema: eventSchema.shape,
         schema: {
           calendarId: z
@@ -1391,7 +1399,10 @@ export class GoogleCalendarTools {
             .optional()
             .describe('Additional calendars (max 49) that must ALSO be free, e.g. attendee email addresses ["alice@example.com"]. Their free/busy must be visible to the user.'),
           duration: z.coerce.number().int().positive().describe('Meeting length in minutes (e.g., 30, 60, 90). Required.'),
-          timezone: z.string().describe('IANA timezone (e.g., "America/New_York", "UTC"). Used for `searchHoursStart`/`searchHoursEnd` and to format response times.'),
+          timezone: z
+            .string()
+            .optional()
+            .describe('IANA timezone (e.g., "America/New_York", "UTC"). Used for `searchHoursStart`/`searchHoursEnd` and to format response times. Defaults to the time zone of `calendarId`.'),
           startFrom: z
             .string()
             .optional()
@@ -1432,7 +1443,7 @@ export class GoogleCalendarTools {
             const googleToken = context.accessToken;
             const {
               duration,
-              timezone,
+              timezone: requestedTimezone,
               searchHoursStart,
               searchHoursEnd,
               includeDays,
@@ -1446,6 +1457,9 @@ export class GoogleCalendarTools {
 
             const allCalendarIds: string[] = [calendarId, ...(calendarIds || [])]
               .filter((id, i, arr) => arr.indexOf(id) === i);
+
+            const timezone = requestedTimezone ?? await fetchCalendarTimeZone(googleToken, calendarId);
+            if (typeof timezone !== 'string') return timezone;
 
             // Resolve startFrom — default to now.
             let searchStart: Date;

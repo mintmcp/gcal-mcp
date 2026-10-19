@@ -53,13 +53,27 @@ afterEach(() => {
 });
 
 describe('get_calendar_events', () => {
-  it('forwards a free-text query and drops the default lower bound so the whole calendar is searched', async () => {
+  it('forwards a free-text query and keeps the default lower bound so upcoming matches come first', async () => {
     enqueue({ items: [] });
     await run('get_calendar_events', { q: 'budget review' });
     expect(calls).toHaveLength(1);
     expect(calls[0].url.searchParams.get('q')).toBe('budget review');
-    expect(calls[0].url.searchParams.has('timeMin')).toBe(false);
+    expect(calls[0].url.searchParams.get('timeMin')).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(calls[0].url.searchParams.has('timeZone')).toBe(false);
+  });
+
+  it('trims the query and rejects one that is only whitespace', async () => {
+    enqueue({ items: [] });
+    await run('get_calendar_events', { q: '  budget review  ' });
+    expect(calls[0].url.searchParams.get('q')).toBe('budget review');
+    await expect(run('get_calendar_events', { q: '   ' })).rejects.toThrow();
+  });
+
+  it('keeps the page token when Google returns an empty page with more results behind it', async () => {
+    enqueue({ items: [], nextPageToken: 'next' });
+    const res = await run('get_calendar_events', { q: 'offsite' });
+    expect(res.structuredContent.nextPageToken).toBe('next');
+    expect(res.structuredContent.message).toContain('pageToken');
   });
 
   it('keeps the default lower bound of now when no query is given', async () => {
@@ -213,6 +227,10 @@ describe('create_event', () => {
 });
 
 describe('update_event', () => {
+  it('is advertised as destructive, since it can remove guests and end a series', () => {
+    expect((GoogleCalendarTools.getTools() as any).update_event.destructiveHint).toBe(true);
+  });
+
   it('adds and removes attendees without resetting everyone else', async () => {
     enqueue({
       ...eventBody,
@@ -328,6 +346,28 @@ describe('get_next_availability', () => {
     expect(calls[0].body.items).toEqual([{ id: 'primary' }, { id: 'bob@example.com' }]);
     expect(res.structuredContent.calendarIds).toEqual(['primary', 'bob@example.com']);
     expect(res.structuredContent.availableSlots[0].start.time).toBe('11:00:00');
+  });
+
+  it('falls back to the calendar time zone when none is given', async () => {
+    enqueue(calendarBody);
+    enqueue({ calendars: { primary: { busy: [] } } });
+    const res = await run('get_next_availability', {
+      duration: 30,
+      startFrom: '2026-10-20T09:00:00',
+      maxResults: 1,
+    });
+    expect(calls[0].url.pathname).toBe('/calendar/v3/calendars/primary');
+    expect(calls[1].body.timeZone).toBe('America/Recife');
+    expect(calls[1].body.timeMin).toBe('2026-10-20T12:00:00.000Z');
+    expect(res.structuredContent.availableSlots[0].start.time).toBe('09:00:00');
+  });
+
+  it('reports the calendar lookup failure instead of guessing a time zone', async () => {
+    enqueue({ error: { message: 'nope' } }, 403);
+    const res = await run('get_next_availability', { duration: 30 });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('time zone');
+    expect(calls).toHaveLength(1);
   });
 
   it('rejects more calendars than one free/busy query can hold', async () => {
