@@ -310,7 +310,7 @@ describe('get_next_availability', () => {
       duration: 30, timezone: 'UTC', startFrom: '2026-10-20T09:00:30Z', startTimeIncrement: 45, maxResults: 3,
     });
     expect(res.structuredContent.availableSlots.map((s: any) => s.start.time)).toEqual(['09:45:00', '10:30:00', '11:15:00']);
-    expect(res.structuredContent.searchedUntil).toBe('2026-10-20T12:00:00');
+    expect(res.structuredContent.searchedUntil).toBe('2026-10-20T12:00:00Z');
     expect(res.structuredContent.exhausted).toBe(false);
   });
 
@@ -326,7 +326,55 @@ describe('get_next_availability', () => {
     const { body } = only(FREE_BUSY);
     expect(body.timeZone).toBe('America/Recife');
     expect(body.timeMin).toBe('2026-10-20T12:00:00.000Z');
-    expect(res.structuredContent.availableSlots[0].start).toEqual({ date: '2026-10-20', time: '09:00:00', dayOfWeek: 'Tue' });
+    expect(res.structuredContent.availableSlots[0].start).toEqual({ date: '2026-10-20', time: '09:00:00', dayOfWeek: 'Tue', timezone: '-03:00' });
+  });
+
+  it('queries free/busy far enough to cover a slot that ends after the search horizon', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
+    await run('get_next_availability', { duration: 90, timezone: 'UTC', startFrom: '2026-10-20T09:00:00Z', maxSearchDays: 1 });
+    const { body } = only(FREE_BUSY);
+    expect(body.timeMin).toBe('2026-10-20T09:00:00.000Z');
+    expect(body.timeMax).toBe('2026-10-21T10:30:00.000Z');
+  });
+
+  it('tells apart slots in the repeated hour by their offsets and pages from an exact instant', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
+    const res = await run('get_next_availability', {
+      duration: 60, timezone: 'America/New_York', startFrom: '2026-11-01T01:30:00', includeDays: ['Sun'], maxResults: 1,
+    });
+    const [slot] = res.structuredContent.availableSlots;
+    expect(slot.start).toEqual({ date: '2026-11-01', time: '01:30:00', dayOfWeek: 'Sun', timezone: '-04:00' });
+    expect(slot.end).toEqual({ date: '2026-11-01', time: '01:30:00', dayOfWeek: 'Sun', timezone: '-05:00' });
+    expect(res.structuredContent.searchedUntil).toBe('2026-11-01T02:00:00-05:00');
+    expect(res.structuredContent.exhausted).toBe(false);
+  });
+
+  it('reports the search as exhausted when exactly maxResults slots fill the horizon', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [{ start: '2026-10-20T00:00:00Z', end: '2026-10-21T22:00:00Z' }] } } });
+    const res = await run('get_next_availability', {
+      duration: 60, timezone: 'UTC', startFrom: '2026-10-20T00:00:00Z', startTimeIncrement: 60, maxResults: 2, maxSearchDays: 2,
+    });
+    expect(res.structuredContent.availableSlots.map((s: any) => s.start.time)).toEqual(['22:00:00', '23:00:00']);
+    expect(res.structuredContent.exhausted).toBe(true);
+    expect(res.structuredContent.searchedUntil).toBe('2026-10-22T00:00:00Z');
+  });
+
+  it('rejects an overnight search window before calling Google', async () => {
+    const res = await run('get_next_availability', { duration: 30, timezone: 'UTC', searchHoursStart: '22:00', searchHoursEnd: '02:00' });
+    expect(res.isError).toBe(true);
+    expect(errorOf(res).error).toMatch(/overnight windows are not supported/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('caps maxResults and startTimeIncrement', async () => {
+    expectInvalid(await run('get_next_availability', { duration: 30, timezone: 'UTC', maxResults: 101 }));
+    expectInvalid(await run('get_next_availability', { duration: 30, timezone: 'UTC', startTimeIncrement: 1441 }));
+  });
+
+  it('sends Google the canonical spelling of the time zone', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
+    await run('get_next_availability', { duration: 30, timezone: 'america/new_york', startFrom: '2026-10-20T09:00:00', maxResults: 1 });
+    expect(only(FREE_BUSY).body.timeZone).toBe('America/New_York');
   });
 
   it('reports the calendar lookup failure instead of guessing a time zone', async () => {

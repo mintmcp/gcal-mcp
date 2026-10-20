@@ -4,11 +4,13 @@ import {
   formatDateTimeWithDay,
   getOffset,
   attachOffsetForTimezone,
+  canonicalTimeZone,
   isValidTimeZone,
-  localTimeExists,
+  localInstant,
   parseIso,
   resolveInstant,
   toInstant,
+  toZonedIso,
 } from "../lib/datetime.js";
 
 describe("getDayOfWeek", () => {
@@ -125,6 +127,14 @@ describe("attachOffsetForTimezone", () => {
     );
   });
 
+  it("resolves a wall time repeated by a fall-back change to its earlier instant in every zone", () => {
+    expect(attachOffsetForTimezone("2024-11-03T01:30:00", "America/New_York")).toBe("2024-11-03T01:30:00-04:00");
+    expect(attachOffsetForTimezone("2024-10-27T01:30:00", "Europe/London")).toBe("2024-10-27T01:30:00+01:00");
+    expect(attachOffsetForTimezone("2024-10-27T02:30:00", "Europe/Berlin")).toBe("2024-10-27T02:30:00+02:00");
+    expect(attachOffsetForTimezone("2024-04-07T02:30:00", "Pacific/Auckland")).toBe("2024-04-07T02:30:00+13:00");
+    expect(attachOffsetForTimezone("2024-04-07T01:45:00", "Australia/Lord_Howe")).toBe("2024-04-07T01:45:00+11:00");
+  });
+
   it("appends BST for Europe/London in summer", () => {
     expect(attachOffsetForTimezone("2024-06-15T12:00:00", "Europe/London")).toBe(
       "2024-06-15T12:00:00+01:00",
@@ -159,12 +169,27 @@ describe("isValidTimeZone", () => {
   });
 });
 
-describe("localTimeExists", () => {
-  it("reports a wall-clock time inside a spring-forward gap as nonexistent", () => {
-    expect(localTimeExists("2027-03-14T02:30:00", "America/New_York")).toBe(false);
-    expect(localTimeExists("2027-03-14T03:30:00", "America/New_York")).toBe(true);
-    expect(localTimeExists("2027-11-07T01:30:00", "America/New_York")).toBe(true);
-    expect(localTimeExists("2027-03-14T02:30:00", "UTC")).toBe(true);
+describe("canonicalTimeZone", () => {
+  it("spells a valid zone the way the IANA database does", () => {
+    expect(canonicalTimeZone("america/new_york")).toBe("America/New_York");
+    expect(canonicalTimeZone("utc")).toBe("UTC");
+  });
+});
+
+describe("localInstant", () => {
+  it("returns the instant of a wall-clock time, or nothing inside a spring-forward gap", () => {
+    expect(localInstant("2027-03-14T02:30:00", "America/New_York")).toBeUndefined();
+    expect(localInstant("2027-03-14T03:30:00", "America/New_York")).toBe("2027-03-14T03:30:00-04:00");
+    expect(localInstant("2027-11-07T01:30:00", "America/New_York")).toBe("2027-11-07T01:30:00-04:00");
+    expect(localInstant("2027-03-14T02:30:00", "UTC")).toBe("2027-03-14T02:30:00Z");
+  });
+});
+
+describe("toZonedIso", () => {
+  it("tells the two passes through a repeated hour apart by their offsets", () => {
+    expect(toZonedIso(new Date("2024-11-03T05:30:00Z"), "America/New_York")).toBe("2024-11-03T01:30:00-04:00");
+    expect(toZonedIso(new Date("2024-11-03T06:30:00Z"), "America/New_York")).toBe("2024-11-03T01:30:00-05:00");
+    expect(toZonedIso(new Date("2024-11-03T06:30:00Z"), "UTC")).toBe("2024-11-03T06:30:00Z");
   });
 });
 

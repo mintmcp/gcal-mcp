@@ -1,15 +1,19 @@
 import { z } from "zod";
-import { HMS_RE, addMinutes, fitsWindow, hmsToSeconds, isSlotBusy, localClock, slotStarts } from "../lib/availability.js";
-import { getDayOfWeek, parseBound, toInstant, toLocalISO, type FormattedDateTime } from "../lib/datetime.js";
+import { HMS_RE, addMinutes, busyChecker, fitsWindow, hmsToSeconds, localClock, slotStarts, type Interval, type SearchWindow } from "../lib/availability.js";
+import { formatDateTimeWithDay, parseBound, toInstant, toZonedIso, type FormattedDateTime } from "../lib/datetime.js";
 import { formattedDateTimeSchema, type FreeBusyResponse } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
 import { defineTool } from "./define.js";
 import { calendarIdSchema, timeZoneSchema } from "./schemas.js";
 
 function formatSlotTime(date: Date, timeZone: string): FormattedDateTime {
-  const local = toLocalISO(date, timeZone);
-  const [day, time] = local.split("T");
-  return { date: day, time, dayOfWeek: getDayOfWeek(local) };
+  return formatDateTimeWithDay({ dateTime: toZonedIso(date, timeZone) });
+}
+
+function searchWindow(days: readonly string[], start: string | undefined, end: string | undefined): SearchWindow {
+  const window = { days, startSeconds: start ? hmsToSeconds(start) : 0, endSeconds: end ? hmsToSeconds(end) : 24 * 3600 };
+  if (window.startSeconds >= window.endSeconds) fail("searchHoursEnd must be after searchHoursStart; overnight windows are not supported.");
+  return window;
 }
 
 function freeBusyFailure(id: string, reason: string | undefined): string {
@@ -28,7 +32,8 @@ export const getNextAvailability = defineTool({
     "Restrict to a daily window via `searchHoursStart`/`searchHoursEnd` (HH:MM[:SS] in `timezone`). " +
     "Restrict to specific weekdays via `includeDays` (default: Mon-Fri). " +
     "Slots align to `startTimeIncrement` (default 30 min) boundaries counted from local midnight in `timezone`; local times skipped by a daylight-saving change are not offered. " +
-    "Returns up to `maxResults` slots (default 10) and a boolean `exhausted` flag: when `exhausted` is true, the full search window was scanned and no more slots exist; when false, paginate by calling again with `startFrom = searchedUntil`. " +
+    "Each slot's start/end carries its UTC offset in its own `timezone` field. " +
+    "Returns up to `maxResults` slots (default 10) and a boolean `exhausted` flag: when `exhausted` is true, the full search window was scanned and no more slots exist; when false, paginate by calling again with `startFrom = searchedUntil` (an RFC 3339 instant with offset). " +
     "CAVEAT: free/busy reflects ONLY the listed calendars; meetings on other calendars the user attends are NOT considered. Surface this to the user before confirming a slot.",
   readOnlyHint: true,
   outputSchema: {
@@ -58,7 +63,7 @@ export const getNextAvailability = defineTool({
       .string()
       .regex(HMS_RE, "searchHoursStart must be HH:MM or HH:MM:SS in 24-hour format")
       .optional()
-      .describe('Daily window start as HH:MM[:SS] in `timezone` (e.g. "09:00"). If omitted, all hours are considered.'),
+      .describe('Daily window start as HH:MM[:SS] in `timezone` (e.g. "09:00"). If omitted, all hours are considered. Must be before `searchHoursEnd`; overnight windows are not supported.'),
     searchHoursEnd: z
       .string()
       .regex(HMS_RE, "searchHoursEnd must be HH:MM or HH:MM:SS in 24-hour format")
@@ -69,11 +74,12 @@ export const getNextAvailability = defineTool({
       .optional()
       .default(["Mon", "Tue", "Wed", "Thu", "Fri"])
       .describe("Weekdays to include. Default: weekdays only."),
-    startTimeIncrement: z.coerce.number().int().positive().optional().default(30).describe("Minutes between candidate start times (e.g. 15, 30). Default 30."),
-    maxResults: z.coerce.number().int().positive().optional().default(10).describe("Maximum slots to return. Default 10."),
+    startTimeIncrement: z.coerce.number().int().positive().max(1440).optional().default(30).describe("Minutes between candidate start times (e.g. 15, 30). Default 30."),
+    maxResults: z.coerce.number().int().positive().max(100).optional().default(10).describe("Maximum slots to return. Default 10, hard cap 100."),
     maxSearchDays: z.coerce.number().int().positive().max(365).optional().default(30).describe("Maximum days ahead of `startFrom` to scan. Default 30, hard cap 365."),
   },
   async run(p, client) {
+    const window = searchWindow(p.includeDays, p.searchHoursStart, p.searchHoursEnd);
     const allCalendarIds = [...new Set([p.calendarId, ...(p.calendarIds ?? [])])];
     const startFrom = p.startFrom === undefined ? undefined : parseBound("startFrom", p.startFrom);
     const timezone = p.timezone ?? (await client.calendar(p.calendarId)).timeZone;
@@ -86,13 +92,13 @@ export const getNextAvailability = defineTool({
       method: "POST",
       body: {
         timeMin: searchStart.toISOString(),
-        timeMax: searchEnd.toISOString(),
+        timeMax: addMinutes(searchEnd, p.duration).toISOString(),
         timeZone: timezone,
         items: allCalendarIds.map((id) => ({ id })),
       },
     }, { operation, resource: "calendar", resourceId: p.calendarId });
 
-    const busyTimes: Array<{ start: Date; end: Date }> = [];
+    const busyTimes: Interval[] = [];
     for (const id of allCalendarIds) {
       const calendar = data?.calendars?.[id];
       if (!calendar) {
@@ -104,25 +110,22 @@ export const getNextAvailability = defineTool({
       }
       for (const busy of calendar.busy ?? []) busyTimes.push({ start: new Date(busy.start), end: new Date(busy.end) });
     }
-    busyTimes.sort((a, b) => a.start.getTime() - b.start.getTime());
 
     const clock = localClock(timezone);
-    const window = {
-      days: p.includeDays,
-      startSeconds: p.searchHoursStart ? hmsToSeconds(p.searchHoursStart) : 0,
-      endSeconds: p.searchHoursEnd ? hmsToSeconds(p.searchHoursEnd) : 24 * 3600,
-    };
+    const isBusy = busyChecker(busyTimes);
     const availableSlots: Array<{ start: FormattedDateTime; end: FormattedDateTime }> = [];
     let searchedUntil = searchEnd;
-    for (const slotStart of slotStarts(searchStart, p.startTimeIncrement, timezone)) {
-      if (slotStart >= searchEnd) break;
+    let exhausted = true;
+    for (const start of slotStarts(searchStart, p.startTimeIncrement, timezone)) {
+      if (start >= searchEnd) break;
       if (availableSlots.length === p.maxResults) {
-        searchedUntil = slotStart;
+        searchedUntil = start;
+        exhausted = false;
         break;
       }
-      const slotEnd = addMinutes(slotStart, p.duration);
-      if (fitsWindow(clock(slotStart), clock(slotEnd), window) && !isSlotBusy(slotStart, slotEnd, busyTimes)) {
-        availableSlots.push({ start: formatSlotTime(slotStart, timezone), end: formatSlotTime(slotEnd, timezone) });
+      const slot = { start, end: addMinutes(start, p.duration) };
+      if (fitsWindow(clock(slot.start), clock(slot.end), window) && !isBusy(slot)) {
+        availableSlots.push({ start: formatSlotTime(slot.start, timezone), end: formatSlotTime(slot.end, timezone) });
       }
     }
 
@@ -130,8 +133,8 @@ export const getNextAvailability = defineTool({
       calendarId: p.calendarId,
       calendarIds: allCalendarIds,
       availableSlots,
-      searchedUntil: toLocalISO(searchedUntil, timezone),
-      exhausted: availableSlots.length < p.maxResults,
+      searchedUntil: toZonedIso(searchedUntil, timezone),
+      exhausted,
     };
   },
 });

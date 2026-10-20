@@ -1,4 +1,4 @@
-import { attachOffsetForTimezone, localTimeExists, toLocalISO } from "./datetime.js";
+import { localInstant, toLocalISO } from "./datetime.js";
 
 export const HMS_RE = /^([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
 
@@ -63,16 +63,36 @@ export function* slotStarts(from: Date, incrementMinutes: number, timeZone: stri
   let seconds = Math.ceil(hmsToSeconds(firstTime) / step) * step;
   for (;;) {
     for (; seconds < DAY_SECONDS; seconds += step) {
-      const local = `${day}T${hms(seconds)}`;
-      if (!localTimeExists(local, timeZone)) continue;
-      const start = new Date(attachOffsetForTimezone(local, timeZone));
-      if (start >= from) yield start;
+      const instant = localInstant(`${day}T${hms(seconds)}`, timeZone);
+      const start = instant && new Date(instant);
+      if (start && start >= from) yield start;
     }
     day = nextDay(day);
     seconds = 0;
   }
 }
 
-export function isSlotBusy(slotStart: Date, slotEnd: Date, busyTimes: Array<{ start: Date; end: Date }>): boolean {
-  return busyTimes.some((busy) => slotStart < busy.end && slotEnd > busy.start);
+export interface Interval {
+  start: Date;
+  end: Date;
+}
+
+export function mergeIntervals(intervals: Interval[]): Interval[] {
+  const merged: Interval[] = [];
+  for (const next of [...intervals].sort((a, b) => a.start.getTime() - b.start.getTime())) {
+    const last = merged.at(-1);
+    if (last && next.start <= last.end) last.end = next.end > last.end ? next.end : last.end;
+    else merged.push({ ...next });
+  }
+  return merged;
+}
+
+// Expects slots in increasing start order, so the cursor only moves forward
+export function busyChecker(busy: Interval[]): (slot: Interval) => boolean {
+  const merged = mergeIntervals(busy);
+  let i = 0;
+  return ({ start, end }) => {
+    while (i < merged.length && merged[i].end <= start) i++;
+    return i < merged.length && merged[i].start < end;
+  };
 }

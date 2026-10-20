@@ -9,6 +9,7 @@ import { renderMarkdown } from "../lib/markdown.js";
 import {
   assertOrdered,
   endOnlyTimes,
+  inZone,
   parseReschedule,
   rangeTimes,
   relabel,
@@ -112,7 +113,7 @@ async function rezonedTimes(p: UpdateArgs, current: CalendarEvent, client: Calen
     if (!stored || "date" in stored.start) {
       fail("`timeZone` does not apply to an all-day event. To make it timed, pass both `start` and `end` as datetimes.");
     }
-    return { start: relabel(stored.start, p.timeZone), end: relabel(stored.end, p.timeZone) };
+    return inZone(stored, p.timeZone);
   }
   if (!stored) return undefined;
   const times = await seriesTimes(stored, isRecurring(p, current), () => seriesZone(p, current, client));

@@ -1,4 +1,4 @@
-import { attachOffsetForTimezone, hasOffset, localTimeExists, parseBound, toLocalISO, type ParsedIso } from "./datetime.js";
+import { attachOffsetForTimezone, hasOffset, localInstant, parseBound, toLocalISO, type ParsedIso } from "./datetime.js";
 import { fail } from "./failure.js";
 import type { CalendarEvent, EventDateTime } from "./event-model.js";
 
@@ -42,17 +42,17 @@ export async function rangeTimes(range: ParsedRange, zone: Zone): Promise<TimePa
   };
 }
 
-export function lacksNamedZone({ start, end }: TimePair): boolean {
-  return "dateTime" in start && "dateTime" in end && !(start.timeZone && end.timeZone);
+export function lacksSharedZone({ start, end }: TimePair): boolean {
+  return "dateTime" in start && "dateTime" in end && !(start.timeZone && start.timeZone === end.timeZone);
 }
 
 export function inZone({ start, end }: TimePair, timeZone: string): TimePair {
-  return { start: { ...start, timeZone }, end: { ...end, timeZone } };
+  return { start: relabel(start, timeZone), end: relabel(end, timeZone) };
 }
 
-// Google requires a named time zone on recurring timed events; an offset alone is rejected
+// Google expands a recurring timed event in one named time zone shared by both endpoints
 export async function seriesTimes(times: TimePair, recurring: boolean, zone: Zone): Promise<TimePair> {
-  return recurring && lacksNamedZone(times) ? inZone(times, await zone()) : times;
+  return recurring && lacksSharedZone(times) ? inZone(times, await zone()) : times;
 }
 
 function instantMs(time: EventTime): number {
@@ -63,7 +63,7 @@ function instantMs(time: EventTime): number {
 
 function skippedLocalTime(time: EventTime): string | undefined {
   if ("date" in time || hasOffset(time.dateTime) || !time.timeZone) return undefined;
-  return localTimeExists(time.dateTime, time.timeZone) ? undefined : `${time.dateTime} does not exist in ${time.timeZone}`;
+  return localInstant(time.dateTime, time.timeZone) ? undefined : `${time.dateTime} does not exist in ${time.timeZone}`;
 }
 
 export function assertOrdered({ start, end }: TimePair): void {

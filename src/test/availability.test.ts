@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { addMinutes, fitsWindow, hmsToSeconds, isSlotBusy, localClock, slotStarts } from "../lib/availability.js";
+import { addMinutes, busyChecker, fitsWindow, hmsToSeconds, localClock, mergeIntervals, slotStarts } from "../lib/availability.js";
 import { toLocalISO } from "../lib/datetime.js";
 
 const utc = localClock("UTC");
@@ -106,6 +106,15 @@ describe("slotStarts", () => {
     expect(local).toEqual(["2024-03-10T01:00:00", "2024-03-10T01:30:00", "2024-03-10T03:00:00", "2024-03-10T03:30:00"]);
   });
 
+  it("offers the repeated hour once, at the earlier offset, when London falls back", () => {
+    expect(take("2024-10-27T00:30:00+01:00", 30, "Europe/London", 4)).toEqual([
+      "2024-10-26T23:30:00.000Z",
+      "2024-10-27T00:00:00.000Z",
+      "2024-10-27T00:30:00.000Z",
+      "2024-10-27T02:00:00.000Z",
+    ]);
+  });
+
   it("offers the repeated hour once, at the earlier offset, when New York falls back", () => {
     expect(take("2024-11-03T00:30:00-04:00", 30, "America/New_York", 5)).toEqual([
       "2024-11-03T04:30:00.000Z",
@@ -125,51 +134,42 @@ describe("addMinutes", () => {
   });
 });
 
-describe("isSlotBusy", () => {
-  const busy = [
-    {
-      start: new Date("2024-01-15T10:00:00Z"),
-      end: new Date("2024-01-15T11:00:00Z"),
-    },
-  ];
+describe("mergeIntervals", () => {
+  const at = (h: number) => new Date(Date.UTC(2024, 0, 15, h));
 
-  it("returns false when slot is entirely before busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T09:00:00Z"),
-        new Date("2024-01-15T10:00:00Z"),
-        busy,
-      ),
-    ).toBe(false);
+  it("sorts and coalesces overlapping and touching intervals without mutating the input", () => {
+    const input = [
+      { start: at(13), end: at(14) },
+      { start: at(9), end: at(11) },
+      { start: at(10), end: at(10) },
+      { start: at(11), end: at(12) },
+    ];
+    expect(mergeIntervals(input)).toEqual([{ start: at(9), end: at(12) }, { start: at(13), end: at(14) }]);
+    expect(input[1]).toEqual({ start: at(9), end: at(11) });
+  });
+});
+
+describe("busyChecker", () => {
+  const at = (h: number, m = 0) => new Date(Date.UTC(2024, 0, 15, h, m));
+  const slot = (h: number, m: number, minutes: number) => ({ start: at(h, m), end: addMinutes(at(h, m), minutes) });
+
+  it("checks slots in order against busy time from several calendars", () => {
+    const isBusy = busyChecker([
+      { start: at(12), end: at(13) },
+      { start: at(10), end: at(11) },
+      { start: at(10, 30), end: at(11, 30) },
+    ]);
+    expect([
+      isBusy(slot(9, 0, 60)),
+      isBusy(slot(9, 30, 60)),
+      isBusy(slot(11, 0, 30)),
+      isBusy(slot(11, 30, 30)),
+      isBusy(slot(11, 30, 60)),
+      isBusy(slot(13, 0, 60)),
+    ]).toEqual([false, true, true, false, true, false]);
   });
 
-  it("returns true when slot partially overlaps busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T10:30:00Z"),
-        new Date("2024-01-15T11:30:00Z"),
-        busy,
-      ),
-    ).toBe(true);
-  });
-
-  it("returns false when slot is entirely after busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T11:00:00Z"),
-        new Date("2024-01-15T12:00:00Z"),
-        busy,
-      ),
-    ).toBe(false);
-  });
-
-  it("returns true when slot contains busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T09:00:00Z"),
-        new Date("2024-01-15T12:00:00Z"),
-        busy,
-      ),
-    ).toBe(true);
+  it("flags a slot that contains a whole busy interval", () => {
+    expect(busyChecker([{ start: at(10), end: at(11) }])(slot(9, 0, 180))).toBe(true);
   });
 });

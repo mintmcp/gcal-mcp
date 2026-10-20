@@ -161,6 +161,22 @@ describe('update_event time zones', () => {
     expect(body.end).toEqual({ dateTime: '2026-10-20T11:00:00-04:00', timeZone: 'Europe/London', date: null });
   });
 
+  it('moves a flight-style event into its start zone when it becomes recurring', async () => {
+    const flight = {
+      ...eventBody,
+      start: { dateTime: '2026-10-20T18:00:00-04:00', timeZone: 'America/New_York' },
+      end: { dateTime: '2026-10-21T06:00:00+01:00', timeZone: 'Europe/London' },
+    };
+    const body = await patchFor({ recurrence: ['RRULE:FREQ=WEEKLY'] }, flight);
+    expect(body.start).toEqual({ dateTime: '2026-10-20T18:00:00-04:00', timeZone: 'America/New_York', date: null });
+    expect(body.end).toEqual({ dateTime: '2026-10-21T06:00:00+01:00', timeZone: 'America/New_York', date: null });
+  });
+
+  it('canonicalizes the spelling of a time zone before sending it to Google', async () => {
+    const body = await patchFor({ timeZone: 'europe/london' }, newYork);
+    expect(body.start.timeZone).toBe('Europe/London');
+  });
+
   it('rejects a time zone passed alone for an all-day event without patching', async () => {
     stub(GET_EVENT, { ...eventBody, start: { date: '2026-10-20' }, end: { date: '2026-10-21' } });
     const res = await run('update_event', { eventId: 'ev1', timeZone: 'Europe/London' });

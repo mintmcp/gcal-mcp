@@ -57,33 +57,31 @@ export function getOffset(timeZone: string, atInstant?: Date): string {
   return offsetPart.replace("GMT", "").trim() || "Z";
 }
 
+const DAY_MS = 24 * 3600 * 1000;
+
+function offsetAround(naiveIso: string, timeZone: string, deltaMs: number): string {
+  return getOffset(timeZone, new Date(Date.parse(`${naiveIso}Z`) + deltaMs));
+}
+
+// Tries the offset before a nearby transition first, so a repeated wall time resolves to its earlier instant
+export function localInstant(naiveIso: string, timeZone: string): string | undefined {
+  const offsets = new Set([offsetAround(naiveIso, timeZone, -DAY_MS), offsetAround(naiveIso, timeZone, DAY_MS)]);
+  return [...offsets]
+    .map((offset) => `${naiveIso}${offset}`)
+    .find((iso) => toLocalISO(new Date(iso), timeZone).startsWith(naiveIso.slice(0, 19)));
+}
+
 export function attachOffsetForTimezone(naiveIso: string, timeZone: string): string {
   if (Number.isNaN(new Date(naiveIso).getTime())) {
     throw new Error(`attachOffsetForTimezone: cannot parse naive ISO "${naiveIso}"`);
   }
   if (timeZone === "UTC") return `${naiveIso}Z`;
-  const nearby = getOffset(timeZone, new Date(`${naiveIso}Z`));
-  const offset = getOffset(timeZone, new Date(`${naiveIso}${nearby}`));
-  if (offset === nearby || wallClockMatches(naiveIso, offset, timeZone)) return `${naiveIso}${offset}`;
   // Google Calendar moves a local time inside a spring-forward gap one hour later
-  const preTransition = offsetMinutes(offset) < offsetMinutes(nearby) ? offset : nearby;
-  return `${naiveIso}${preTransition}`;
+  return localInstant(naiveIso, timeZone) ?? `${naiveIso}${offsetAround(naiveIso, timeZone, -DAY_MS)}`;
 }
 
-function offsetMinutes(offset: string): number {
-  if (offset === "Z") return 0;
-  const sign = offset.startsWith("-") ? -1 : 1;
-  const [h, m] = offset.slice(1).split(":").map(Number);
-  return sign * (h * 60 + m);
-}
-
-function wallClockMatches(naiveIso: string, offset: string, timeZone: string): boolean {
-  const local = toLocalISO(new Date(`${naiveIso}${offset}`), timeZone);
-  return local.startsWith(naiveIso.slice(0, 19));
-}
-
-export function localTimeExists(naiveIso: string, timeZone: string): boolean {
-  return wallClockMatches(naiveIso, attachOffsetForTimezone(naiveIso, timeZone).slice(naiveIso.length), timeZone);
+export function toZonedIso(date: Date, timeZone: string): string {
+  return `${toLocalISO(date, timeZone)}${getOffset(timeZone, date)}`;
 }
 
 export function isValidTimeZone(timeZone: string): boolean {
@@ -93,6 +91,10 @@ export function isValidTimeZone(timeZone: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function canonicalTimeZone(timeZone: string): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone }).resolvedOptions().timeZone;
 }
 
 export function toInstant(parsed: ParsedIso, timeZone: string): string {

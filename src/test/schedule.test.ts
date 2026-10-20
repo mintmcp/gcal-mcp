@@ -3,11 +3,12 @@ import {
   assertOrdered,
   endOnlyTimes,
   inZone,
-  lacksNamedZone,
+  lacksSharedZone,
   parseRange,
   parseReschedule,
   rangeTimes,
   relabel,
+  seriesTimes,
   shiftedTimes,
   toPatchTime,
 } from '../lib/schedule.js';
@@ -128,9 +129,22 @@ describe('relabel', () => {
 describe('named zones and patch shapes', () => {
   it('spots timed ranges without a named zone and fills one in', () => {
     const offsetOnly = { start: { dateTime: '2026-10-20T10:00:00Z' }, end: { dateTime: '2026-10-20T11:00:00Z' } };
-    expect(lacksNamedZone(offsetOnly)).toBe(true);
-    expect(lacksNamedZone({ start: { date: '2026-10-20' }, end: { date: '2026-10-21' } })).toBe(false);
-    expect(lacksNamedZone(inZone(offsetOnly, 'UTC'))).toBe(false);
+    expect(lacksSharedZone(offsetOnly)).toBe(true);
+    expect(lacksSharedZone({ start: { date: '2026-10-20' }, end: { date: '2026-10-21' } })).toBe(false);
+    expect(lacksSharedZone(inZone(offsetOnly, 'UTC'))).toBe(false);
+  });
+
+  it('moves a series with two different endpoint zones into one zone keeping both instants', async () => {
+    const flight = {
+      start: { dateTime: '2026-10-20T18:00:00', timeZone: 'America/New_York' },
+      end: { dateTime: '2026-10-21T06:00:00', timeZone: 'Europe/London' },
+    };
+    expect(lacksSharedZone(flight)).toBe(true);
+    expect(await seriesTimes(flight, false, noZone)).toBe(flight);
+    expect(await seriesTimes(flight, true, zone('America/New_York'))).toEqual({
+      start: { dateTime: '2026-10-20T18:00:00', timeZone: 'America/New_York' },
+      end: { dateTime: '2026-10-21T06:00:00+01:00', timeZone: 'America/New_York' },
+    });
   });
 
   it('clears the other kind so a PATCH can switch between timed and all-day', () => {
