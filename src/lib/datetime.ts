@@ -22,8 +22,10 @@ function offsetMinutes(timeZone: string, date: Date): number {
   const cached = offsetFormatters.get(timeZone) ?? new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" });
   offsetFormatters.set(timeZone, cached);
   const name = cached.formatToParts(date).find((p) => p.type === "timeZoneName")?.value ?? "";
+  if (name === "GMT") return 0;
   const match = /^GMT([+-])(\d{2}):(\d{2})/.exec(name);
-  return match ? (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3])) : 0;
+  if (!match) throw new Error(`Unexpected UTC offset "${name}" for ${timeZone}`);
+  return (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3]));
 }
 
 export function hasOffset(dateTime: string): boolean {

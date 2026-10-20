@@ -79,9 +79,9 @@ function previousDay(date: string): string {
 
 export function* slotStarts(from: Date, incrementMinutes: number, timeZone: string): Generator<Date, never> {
   const step = incrementMinutes * 60;
-  const [firstDay, firstTime] = toLocalISO(from, timeZone).split("T");
-  let day = firstDay;
-  let seconds = Math.ceil(hmsToSeconds(firstTime) / step) * step;
+  const first = localClock(timeZone)(from);
+  let day = first.date;
+  let seconds = Math.ceil(first.seconds / step) * step;
   for (;;) {
     for (; seconds < DAY_SECONDS; seconds += step) {
       const instant = localInstant(`${day}T${hms(seconds)}`, timeZone);
