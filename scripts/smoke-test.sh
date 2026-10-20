@@ -4,7 +4,7 @@
 # asserts that:
 #   - /healthz returns 200 with {"status":"ok"}
 #   - POST /mcp `initialize` returns a protocolVersion
-#   - POST /mcp `tools/list` lists exactly 6 tools
+#   - POST /mcp `tools/list` lists exactly 8 tools
 #   - POST /mcp `tools/call list_calendars` with a fake bearer token returns
 #     a structured error (not a 5xx crash) and the container is still alive.
 #
@@ -143,11 +143,11 @@ if [ "${STATUS}" != "200" ]; then
   exit 1
 fi
 TOOL_COUNT=$(printf '%s' "${PAYLOAD}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(len(d.get("result",{}).get("tools",[])))' 2>/dev/null || echo 0)
-if [ "${TOOL_COUNT}" != "6" ]; then
-  red "expected 6 tools, got ${TOOL_COUNT}. Response: ${PAYLOAD}"
+if [ "${TOOL_COUNT}" != "8" ]; then
+  red "expected 8 tools, got ${TOOL_COUNT}. Response: ${PAYLOAD}"
   exit 1
 fi
-green "tools/list OK (6 tools)"
+green "tools/list OK (8 tools)"
 
 step "POST /mcp tools/call list_calendars (fake token)"
 RESP=$(post_mcp_tolerant '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_calendars","arguments":{}}}')

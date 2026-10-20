@@ -4,11 +4,13 @@ import {
   formatDateTimeWithDay,
   getOffset,
   attachOffsetForTimezone,
-  normalizeAttendees,
-  isWithinSearchHours,
-  alignToSlotBoundary,
-  advanceToNextSlot,
-  isSlotBusy,
+  canonicalTimeZone,
+  isValidTimeZone,
+  localInstant,
+  parseIso,
+  resolveInstant,
+  toInstant,
+  toZonedIso,
 } from "../lib/datetime.js";
 
 describe("getDayOfWeek", () => {
@@ -105,6 +107,34 @@ describe("attachOffsetForTimezone", () => {
     );
   });
 
+  it("uses the offset in force at that wall-clock time right after a DST switch", () => {
+    expect(attachOffsetForTimezone("2026-03-08T03:30:00", "America/Los_Angeles")).toBe(
+      "2026-03-08T03:30:00-07:00",
+    );
+    expect(attachOffsetForTimezone("2026-11-01T03:30:00", "America/Los_Angeles")).toBe(
+      "2026-11-01T03:30:00-08:00",
+    );
+  });
+
+  it("moves a nonexistent local time in a spring-forward gap one hour later, like the Calendar UI", () => {
+    // 02:30 does not exist on 2026-03-08 in LA; the clock jumps 02:00 -> 03:00
+    // Shifting forward lands on 03:30 PDT, the same instant as 02:30 PST
+    expect(attachOffsetForTimezone("2026-03-08T02:30:00", "America/Los_Angeles")).toBe(
+      "2026-03-08T02:30:00-08:00",
+    );
+    expect(attachOffsetForTimezone("2026-03-29T01:30:00", "Europe/London")).toBe(
+      "2026-03-29T01:30:00+00:00",
+    );
+  });
+
+  it("resolves a wall time repeated by a fall-back change to its earlier instant in every zone", () => {
+    expect(attachOffsetForTimezone("2024-11-03T01:30:00", "America/New_York")).toBe("2024-11-03T01:30:00-04:00");
+    expect(attachOffsetForTimezone("2024-10-27T01:30:00", "Europe/London")).toBe("2024-10-27T01:30:00+01:00");
+    expect(attachOffsetForTimezone("2024-10-27T02:30:00", "Europe/Berlin")).toBe("2024-10-27T02:30:00+02:00");
+    expect(attachOffsetForTimezone("2024-04-07T02:30:00", "Pacific/Auckland")).toBe("2024-04-07T02:30:00+13:00");
+    expect(attachOffsetForTimezone("2024-04-07T01:45:00", "Australia/Lord_Howe")).toBe("2024-04-07T01:45:00+11:00");
+  });
+
   it("appends BST for Europe/London in summer", () => {
     expect(attachOffsetForTimezone("2024-06-15T12:00:00", "Europe/London")).toBe(
       "2024-06-15T12:00:00+01:00",
@@ -124,226 +154,67 @@ describe("attachOffsetForTimezone", () => {
   });
 });
 
-describe("normalizeAttendees", () => {
-  it("returns undefined for undefined input", () => {
-    expect(normalizeAttendees(undefined)).toBeUndefined();
+describe("parseIso", () => {
+  it("rejects a naive datetime whose calendar date does not exist", () => {
+    expect(parseIso("2026-13-45T10:00:00")).toBeNull();
+    expect(parseIso("2026-10-20T10:00:00")).toEqual({ kind: "datetime", rfc3339: "2026-10-20T10:00:00", hasOffset: false });
   });
 
-  it("returns empty array for empty input", () => {
-    expect(normalizeAttendees([])).toEqual([]);
-  });
-
-  it("normalises bare email strings to { email }", () => {
-    expect(normalizeAttendees(["a@x.com", "b@x.com"])).toEqual([
-      { email: "a@x.com" },
-      { email: "b@x.com" },
-    ]);
-  });
-
-  it("preserves displayName and optional=true when set", () => {
-    expect(
-      normalizeAttendees([
-        { email: "a@x.com", displayName: "Alice", optional: true },
-      ]),
-    ).toEqual([{ email: "a@x.com", displayName: "Alice", optional: true }]);
-  });
-
-  it("omits optional when it is false (only sets when truly true)", () => {
-    expect(
-      normalizeAttendees([{ email: "a@x.com", optional: false }]),
-    ).toEqual([{ email: "a@x.com" }]);
-  });
-
-  it("omits empty displayName", () => {
-    expect(
-      normalizeAttendees([{ email: "a@x.com", displayName: "" }]),
-    ).toEqual([{ email: "a@x.com" }]);
-  });
-
-  it("mixes bare emails and objects in one list", () => {
-    expect(
-      normalizeAttendees(["a@x.com", { email: "b@x.com", displayName: "B" }]),
-    ).toEqual([{ email: "a@x.com" }, { email: "b@x.com", displayName: "B" }]);
+  it("rejects dates and times that Date.parse would roll over", () => {
+    expect(parseIso("2026-02-29")).toBeNull();
+    expect(parseIso("2026-04-31T10:00")).toBeNull();
+    expect(parseIso("2026-02-31T10:00:00-03:00")).toBeNull();
+    expect(parseIso("2026-01-01T24:00:00")).toBeNull();
+    expect(parseIso("2028-02-29")).toEqual({ kind: "date", date: "2028-02-29" });
+    expect(parseIso("2026-10-20T10:00:00.500Z")).toEqual({ kind: "datetime", rfc3339: "2026-10-20T10:00:00.500Z", hasOffset: true });
   });
 });
 
-describe("isWithinSearchHours", () => {
-  // Monday 2024-01-15 10:00 UTC.
-  const monMorning = new Date("2024-01-15T10:00:00Z");
-  // Monday 2024-01-15 17:00 UTC.
-  const monFivePm = new Date("2024-01-15T17:00:00Z");
-  // Saturday 2024-01-13 10:00 UTC.
-  const satMorning = new Date("2024-01-13T10:00:00Z");
-
-  it("accepts a mid-window slot start", () => {
-    expect(
-      isWithinSearchHours(monMorning, {
-        timeZone: "UTC",
-        includeDays: ["Mon", "Tue", "Wed", "Thu", "Fri"],
-        searchHoursStart: "09:00",
-        searchHoursEnd: "17:00",
-        boundary: "start",
-      }),
-    ).toBe(true);
-  });
-
-  it("accepts a slot end that exactly hits searchHoursEnd (boundary='end')", () => {
-    // Round-2 bug fix: a 16:00-17:00 meeting must fit a "until 17:00" window.
-    expect(
-      isWithinSearchHours(monFivePm, {
-        timeZone: "UTC",
-        includeDays: ["Mon", "Tue", "Wed", "Thu", "Fri"],
-        searchHoursStart: "09:00",
-        searchHoursEnd: "17:00",
-        boundary: "end",
-      }),
-    ).toBe(true);
-  });
-
-  it("rejects a slot start that exactly hits searchHoursEnd (boundary='start')", () => {
-    expect(
-      isWithinSearchHours(monFivePm, {
-        timeZone: "UTC",
-        includeDays: ["Mon", "Tue", "Wed", "Thu", "Fri"],
-        searchHoursStart: "09:00",
-        searchHoursEnd: "17:00",
-        boundary: "start",
-      }),
-    ).toBe(false);
-  });
-
-  it("applies the weekday filter even when no hour window is set", () => {
-    // Round-2 bug fix: includeDays must apply with or without hour bounds.
-    expect(
-      isWithinSearchHours(satMorning, {
-        timeZone: "UTC",
-        includeDays: ["Mon", "Tue", "Wed", "Thu", "Fri"],
-        boundary: "start",
-      }),
-    ).toBe(false);
-  });
-
-  it("allows the weekday when it is explicitly in includeDays without an hour window", () => {
-    expect(
-      isWithinSearchHours(satMorning, {
-        timeZone: "UTC",
-        includeDays: ["Sat"],
-        boundary: "start",
-      }),
-    ).toBe(true);
-  });
-
-  it("throws on malformed searchHours value instead of silently coercing", () => {
-    const monMorning = new Date("2024-01-15T09:00:00Z"); // Mon UTC
-    expect(() =>
-      isWithinSearchHours(monMorning, {
-        timeZone: "UTC",
-        searchHoursStart: "9am",
-        searchHoursEnd: "17:00",
-        boundary: "start",
-      }),
-    ).toThrow(/HH:MM\[:SS\]/);
+describe("isValidTimeZone", () => {
+  it("accepts IANA names and rejects made-up ones", () => {
+    expect(isValidTimeZone("America/New_York")).toBe(true);
+    expect(isValidTimeZone("UTC")).toBe(true);
+    expect(isValidTimeZone("Not/AZone")).toBe(false);
   });
 });
 
-describe("alignToSlotBoundary", () => {
-  it("returns an equal time when already aligned", () => {
-    const t = new Date("2024-01-15T10:00:00Z");
-    expect(alignToSlotBoundary(t, 30).getTime()).toBe(t.getTime());
-  });
-
-  it("rounds up 10:07 to 10:30 on a 30-minute grid", () => {
-    const t = new Date("2024-01-15T10:07:00Z");
-    const out = alignToSlotBoundary(t, 30);
-    expect(out.getUTCMinutes()).toBe(30);
-    expect(out.getUTCSeconds()).toBe(0);
-    expect(out.getUTCHours()).toBe(10);
-  });
-
-  it("rounds up 10:01 to 10:15 on a 15-minute grid", () => {
-    const t = new Date("2024-01-15T10:01:00Z");
-    const out = alignToSlotBoundary(t, 15);
-    expect(out.getUTCMinutes()).toBe(15);
-  });
-
-  it("zeroes seconds/ms even when the minute is already on-grid", () => {
-    // Regression: a now-time of 10:30:17.123 used to stay off-grid because
-    // remainder=0 short-circuited the seconds/ms reset.
-    const t = new Date("2024-01-15T10:30:17.123Z");
-    const out = alignToSlotBoundary(t, 30);
-    expect(out.getUTCHours()).toBe(10);
-    expect(out.getUTCMinutes()).toBe(30);
-    expect(out.getUTCSeconds()).toBe(0);
-    expect(out.getUTCMilliseconds()).toBe(0);
-  });
-
-  it("does not mutate the input", () => {
-    const t = new Date("2024-01-15T10:07:42Z");
-    const beforeMs = t.getTime();
-    alignToSlotBoundary(t, 30);
-    expect(t.getTime()).toBe(beforeMs);
-  });
-
-  it("throws on non-positive incrementMinutes instead of producing NaN", () => {
-    const t = new Date("2024-01-15T10:00:00Z");
-    expect(() => alignToSlotBoundary(t, 0)).toThrow(/positive integer/);
-    expect(() => alignToSlotBoundary(t, -15)).toThrow(/positive integer/);
-    expect(() => alignToSlotBoundary(t, 1.5)).toThrow(/positive integer/);
+describe("canonicalTimeZone", () => {
+  it("spells a valid zone the way the IANA database does", () => {
+    expect(canonicalTimeZone("america/new_york")).toBe("America/New_York");
+    expect(canonicalTimeZone("utc")).toBe("UTC");
   });
 });
 
-describe("advanceToNextSlot", () => {
-  it("adds incrementMinutes", () => {
-    const t = new Date("2024-01-15T10:00:00Z");
-    expect(advanceToNextSlot(t, 30).toISOString()).toBe("2024-01-15T10:30:00.000Z");
+describe("localInstant", () => {
+  it("returns the instant of a wall-clock time, or nothing inside a spring-forward gap", () => {
+    expect(localInstant("2027-03-14T02:30:00", "America/New_York")).toBeUndefined();
+    expect(localInstant("2027-03-14T03:30:00", "America/New_York")).toBe("2027-03-14T03:30:00-04:00");
+    expect(localInstant("2027-11-07T01:30:00", "America/New_York")).toBe("2027-11-07T01:30:00-04:00");
+    expect(localInstant("2027-03-14T02:30:00", "UTC")).toBe("2027-03-14T02:30:00Z");
   });
 });
 
-describe("isSlotBusy", () => {
-  const busy = [
-    {
-      start: new Date("2024-01-15T10:00:00Z"),
-      end: new Date("2024-01-15T11:00:00Z"),
-    },
-  ];
+describe("toZonedIso", () => {
+  it("tells the two passes through a repeated hour apart by their offsets", () => {
+    expect(toZonedIso(new Date("2024-11-03T05:30:00Z"), "America/New_York")).toBe("2024-11-03T01:30:00-04:00");
+    expect(toZonedIso(new Date("2024-11-03T06:30:00Z"), "America/New_York")).toBe("2024-11-03T01:30:00-05:00");
+    expect(toZonedIso(new Date("2024-11-03T06:30:00Z"), "UTC")).toBe("2024-11-03T06:30:00Z");
+  });
+});
 
-  it("returns false when slot is entirely before busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T09:00:00Z"),
-        new Date("2024-01-15T10:00:00Z"),
-        busy,
-      ),
-    ).toBe(false);
+describe("toInstant", () => {
+  it("anchors dates at local midnight, naive times in the zone, and keeps explicit offsets", () => {
+    expect(toInstant({ kind: "date", date: "2026-10-20" }, "America/Recife")).toBe("2026-10-20T00:00:00-03:00");
+    expect(toInstant({ kind: "datetime", rfc3339: "2026-10-20T10:00:00", hasOffset: false }, "America/Recife")).toBe("2026-10-20T10:00:00-03:00");
+    expect(toInstant({ kind: "datetime", rfc3339: "2026-10-20T10:00:00Z", hasOffset: true }, "America/Recife")).toBe("2026-10-20T10:00:00Z");
   });
 
-  it("returns true when slot partially overlaps busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T10:30:00Z"),
-        new Date("2024-01-15T11:30:00Z"),
-        busy,
-      ),
-    ).toBe(true);
-  });
-
-  it("returns false when slot is entirely after busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T11:00:00Z"),
-        new Date("2024-01-15T12:00:00Z"),
-        busy,
-      ),
-    ).toBe(false);
-  });
-
-  it("returns true when slot contains busy", () => {
-    expect(
-      isSlotBusy(
-        new Date("2024-01-15T09:00:00Z"),
-        new Date("2024-01-15T12:00:00Z"),
-        busy,
-      ),
-    ).toBe(true);
+  it("only asks for the zone when the input needs one", async () => {
+    let asked = 0;
+    const zone = async () => { asked++; return "America/Recife"; };
+    expect(await resolveInstant({ kind: "datetime", rfc3339: "2026-10-20T10:00:00Z", hasOffset: true }, zone)).toBe("2026-10-20T10:00:00Z");
+    expect(asked).toBe(0);
+    expect(await resolveInstant({ kind: "date", date: "2026-10-20" }, zone)).toBe("2026-10-20T00:00:00-03:00");
+    expect(asked).toBe(1);
   });
 });

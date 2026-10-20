@@ -1,9 +1,9 @@
 # gcal-mcp
 
 A Model Context Protocol (MCP) server that exposes Google Calendar to MintMCP
-clients. The server speaks streamable HTTP at `/mcp` on port `8000`, runs as a
-single module-scope `McpServer` registered once at startup, and reads the
-caller's Google OAuth access token from the per-request `Authorization` header
+clients. The server speaks streamable HTTP at `/mcp` on port `8000`, builds a
+fresh `McpServer` for each request so overlapping calls never share a
+transport, and reads the caller's Google OAuth access token from the per-request `Authorization` header
 via `AsyncLocalStorage`. It offers a focused, LLM-friendly tool surface
 covering calendar discovery, event read/write, and free/busy availability
 search.
@@ -46,7 +46,10 @@ Eight tools across four categories:
 
 Every tool declares both `inputSchema` and `outputSchema` and returns
 `structuredContent`. Annotations (`readOnlyHint`, `destructiveHint`) are set
-where appropriate. See `src/tools.ts` for the full definitions.
+where appropriate. Each tool lives in `src/tools/<tool>.ts` and is built with `defineTool`
+(`src/tools/define.ts`); `src/tools/index.ts` assembles them. Shared Google
+API access sits in `src/google/client.ts` and the date, schedule, attendee and
+event-option helpers in `src/lib/`.
 
 ## Local build and run
 
@@ -92,12 +95,13 @@ curl -s -X POST http://localhost:8000/mcp \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{}}'
 ```
 
-A scripted end-to-end smoke test that builds the image, boots it, and asserts
-the four endpoints above is available via `npm run smoke`.
+A scripted end-to-end smoke test that builds the image, boots it, and checks
+`/healthz`, `initialize`, `tools/list` and a `tools/call` is available via
+`npm run smoke`.
 
 ## Tests
 
 ```bash
-npm test         # vitest unit tests for the datetime / attendee helpers
+npm test         # vitest unit and tool handler tests
 npm run smoke    # full Docker smoke test (requires Docker + python3)
 ```

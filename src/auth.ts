@@ -43,34 +43,3 @@ export const requireAccessToken: RequestHandler = (req, res, next) => {
   }
   requestContext.run({ accessToken }, next);
 };
-
-/**
- * Wraps a tool handler so it can read the Google access token from
- * AsyncLocalStorage. MintMCP forwards the user's OAuth token as
- * `Authorization: Bearer <token>` on every request; requireAccessToken parses it
- * and runs the request inside requestContext.run().
- *
- * The `scope` parameter is informational only — MintMCP enforces scope
- * gating at the connector configuration level, so the server doesn't
- * need to re-check.
- */
-export function withGoogleAuth<TArgs>(
-  _scope: string,
-  handler: (args: TArgs, context: { accessToken: string }) => Promise<any>,
-) {
-  return async (args: TArgs) => {
-    const accessToken = getAccessToken();
-    if (!accessToken) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ error: NOT_CONNECTED_MESSAGE, status: 401 }),
-          },
-        ],
-        isError: true,
-      };
-    }
-    return handler(args, { accessToken });
-  };
-}
