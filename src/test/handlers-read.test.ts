@@ -300,6 +300,13 @@ describe('get_next_availability', () => {
     expect(res.structuredContent.availableSlots[0].start.time).toBe('11:00:00');
   });
 
+  it('explains that a calendar without free/busy data, like a holiday calendar, has to be left out', async () => {
+    const holidays = 'en.brazilian#holiday@group.v.calendar.google.com';
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] }, [holidays]: { errors: [{ domain: 'global', reason: 'notFound' }] } } });
+    const res = await run('get_next_availability', { duration: 30, timezone: 'UTC', calendarIds: [holidays] });
+    expect(errorOf(res).error).toMatch(/publishes no free\/busy.*Leave it out of calendarIds/);
+  });
+
   it('offers slots on local hour and half-hour boundaries in zones with uneven offsets', async () => {
     stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
     const kolkata = await run('get_next_availability', {

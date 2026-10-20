@@ -5,7 +5,7 @@ import { attendeeInputSchema, normalizeAttendees } from "../lib/attendees.js";
 import { buildEventOptions, eventOptionsInputSchema, eventTypeInputSchema, validateEventTypeTimes } from "../lib/event-options.js";
 import { eventSchema } from "../lib/event-model.js";
 import { renderMarkdown } from "../lib/markdown.js";
-import { assertOrdered, parseRange, rangeTimes, seriesTimes } from "../lib/schedule.js";
+import { assertSchedulable, parseRange, rangeTimes, seriesTimes } from "../lib/schedule.js";
 import { defineTool } from "./define.js";
 import { calendarIdSchema, inputTimeZoneSchema, sendUpdatesSchema } from "./schemas.js";
 import { writeEvent } from "./write-event.js";
@@ -49,7 +49,7 @@ export const createEvent = defineTool({
     const zone = client.zone(p.calendarId, p.timeZone);
     const times = await seriesTimes(await rangeTimes(range, zone), Boolean(options.recurrence?.length), zone);
     validateEventTypeTimes(options.eventType, times);
-    assertOrdered(times);
+    assertSchedulable(times);
 
     const body = {
       summary: p.summary,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  assertOrdered,
+  assertSchedulable,
   endOnlyTimes,
   inZone,
   lacksSharedZone,
@@ -47,10 +47,10 @@ describe('rangeTimes', () => {
   });
 });
 
-describe('assertOrdered', () => {
+describe('assertSchedulable', () => {
   it('rejects a range that ends before it starts', () => {
-    expect(() => assertOrdered({ start: { date: '2026-10-21' }, end: { date: '2026-10-21' } })).toThrow(/after `start`/);
-    expect(() => assertOrdered({
+    expect(() => assertSchedulable({ start: { date: '2026-10-21' }, end: { date: '2026-10-21' } })).toThrow(/after `start`/);
+    expect(() => assertSchedulable({
       start: { dateTime: '2026-10-20T11:00:00-03:00' },
       end: { dateTime: '2026-10-20T10:00:00', timeZone: 'America/Recife' },
     })).toThrow(/after `start`/);
@@ -58,7 +58,7 @@ describe('assertOrdered', () => {
 
   it('names the skipped local time when a spring-forward gap collapses the range', () => {
     const tz = 'America/New_York';
-    expect(() => assertOrdered({
+    expect(() => assertSchedulable({
       start: { dateTime: '2027-03-14T02:30:00', timeZone: tz },
       end: { dateTime: '2027-03-14T03:30:00', timeZone: tz },
     })).toThrow(/2027-03-14T02:30:00 does not exist in America\/New_York/);
@@ -66,23 +66,30 @@ describe('assertOrdered', () => {
 
   it('rejects an endpoint on the second pass of a repeated hour, which Google would read as the first pass', () => {
     const tz = 'America/New_York';
-    expect(() => assertOrdered({
+    expect(() => assertSchedulable({
       start: { dateTime: '2026-11-01T01:30:00', timeZone: tz },
       end: { dateTime: '2026-11-01T01:30:00-05:00', timeZone: tz },
     })).toThrow(/2026-11-01T01:30:00-05:00 \(2026-11-01T01:30:00 in America\/New_York\) falls in the second pass/);
-    expect(() => assertOrdered({
+    expect(() => assertSchedulable({
       start: { dateTime: '2026-11-01T01:00:00-04:00', timeZone: tz },
       end: { dateTime: '2026-11-01T01:30:00-04:00', timeZone: tz },
     })).not.toThrow();
-    expect(() => assertOrdered({
+    expect(() => assertSchedulable({
       start: { dateTime: '2026-11-01T01:00:00-04:00' },
       end: { dateTime: '2026-11-01T01:30:00-05:00' },
     })).not.toThrow();
   });
 
+  it('accepts times in zones whose historic offset has seconds', () => {
+    expect(() => assertSchedulable({
+      start: { dateTime: '1880-06-01T10:00:00-04:56', timeZone: 'America/New_York' },
+      end: { dateTime: '1880-06-01T16:00:00Z', timeZone: 'America/New_York' },
+    })).not.toThrow();
+  });
+
   it('accepts a gap time when the range still ends after it starts', () => {
     const tz = 'America/New_York';
-    expect(() => assertOrdered({
+    expect(() => assertSchedulable({
       start: { dateTime: '2027-03-14T02:30:00', timeZone: tz },
       end: { dateTime: '2027-03-14T04:00:00', timeZone: tz },
     })).not.toThrow();

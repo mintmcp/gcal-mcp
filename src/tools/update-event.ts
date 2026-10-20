@@ -7,7 +7,7 @@ import { eventSchema, type CalendarEvent, type EventAttachment } from "../lib/ev
 import { fail } from "../lib/failure.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import {
-  assertOrdered,
+  assertSchedulable,
   endOnlyTimes,
   inZone,
   parseReschedule,
@@ -124,7 +124,7 @@ async function schedulePatch(p: UpdateArgs, reschedule: Reschedule | undefined, 
   const times = reschedule ? await rescheduledTimes(p, reschedule, current, client) : await rezonedTimes(p, current, client);
   if (!times) return {};
   validateEventTypeTimes(current.eventType, times);
-  assertOrdered(times);
+  assertSchedulable(times);
   return { start: toPatchTime(times.start), end: toPatchTime(times.end) };
 }
 

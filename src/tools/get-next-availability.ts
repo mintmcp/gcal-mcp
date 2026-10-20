@@ -20,7 +20,9 @@ function searchWindow(days: readonly string[], start: string | undefined, end: s
 }
 
 function freeBusyFailure(id: string, reason: string | undefined): string {
-  if (reason === "notFound") return `Calendar "${id}" not found. Verify via list_calendars.`;
+  if (reason === "notFound") {
+    return `Google has no free/busy data for "${id}": it does not exist, or it is a calendar that publishes no free/busy (a subscribed calendar such as holidays, or an outside account). Leave it out of calendarIds.`;
+  }
   if (reason === "forbidden") return `Access denied for calendar "${id}". The authenticated user cannot read its free/busy info.`;
   return `Free/busy lookup failed for calendar "${id}": ${reason || "unknown error"}.`;
 }

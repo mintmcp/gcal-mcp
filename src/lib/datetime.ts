@@ -60,7 +60,8 @@ export function getOffset(timeZone: string, atInstant?: Date): string {
   const probe = atInstant ?? new Date();
   if (Number.isNaN(probe.getTime())) return "Z";
   const offsetPart = formatter(timeZone, "offset").formatToParts(probe).find((p) => p.type === "timeZoneName")?.value || "";
-  return offsetPart.replace("GMT", "").trim() || "Z";
+  // Historic local mean time offsets carry seconds (-04:56:02), which RFC 3339 cannot express
+  return offsetPart.replace("GMT", "").trim().replace(/^([+-]\d{2}:\d{2}):\d{2}$/, "$1") || "Z";
 }
 
 const DAY_MS = 24 * 3600 * 1000;

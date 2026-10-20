@@ -48,6 +48,21 @@ describe('update_event reschedule with one bound', () => {
     expect(body.end).toMatchObject({ dateTime: '2026-10-22T19:30:00+01:00', timeZone: 'Europe/Lisbon' });
   });
 
+  it('rejects a start-only move whose derived end lands on the second pass of a repeated hour, without patching', async () => {
+    const ny = { start: { dateTime: '2026-10-30T09:00:00-04:00', timeZone: 'America/New_York' }, end: { dateTime: '2026-10-30T10:30:00-04:00', timeZone: 'America/New_York' } };
+    stub(GET_EVENT, { ...eventBody, ...ny });
+    const res = await run('update_event', { eventId: 'ev1', start: '2026-11-01T00:30:00-04:00' });
+    expect(errorOf(res).error).toMatch(/2026-11-01T01:00:00-05:00 .* falls in the second pass.*outside the repeated hour/);
+    expect(callsTo(PATCH_EVENT)).toHaveLength(0);
+  });
+
+  it('rejects relabelling an event into a zone where it would sit on the second pass of a repeated hour', async () => {
+    stub(GET_EVENT, { ...eventBody, start: { dateTime: '2026-11-01T06:30:00Z' }, end: { dateTime: '2026-11-01T07:30:00Z' } });
+    const res = await run('update_event', { eventId: 'ev1', timeZone: 'America/New_York' });
+    expect(errorOf(res).error).toMatch(/falls in the second pass/);
+    expect(callsTo(PATCH_EVENT)).toHaveLength(0);
+  });
+
   it('shifts an all-day event by whole days when only a new start date is given', async () => {
     stub(GET_EVENT, { ...eventBody, start: { date: '2026-10-20' }, end: { date: '2026-10-22' } });
     stub(PATCH_EVENT, eventBody);
