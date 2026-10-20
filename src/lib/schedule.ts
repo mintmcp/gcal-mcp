@@ -1,4 +1,4 @@
-import { attachOffsetForTimezone, hasOffset, localInstant, parseBound, toZonedIso, type ParsedIso } from "./datetime.js";
+import { attachOffsetForTimezone, hasOffset, localInstant, parseBound, toLocalISO, toZonedIso, type ParsedIso } from "./datetime.js";
 import { fail } from "./failure.js";
 import type { CalendarEvent, EventDateTime } from "./event-model.js";
 
@@ -66,7 +66,20 @@ function skippedLocalTime(time: EventTime): string | undefined {
   return localInstant(time.dateTime, time.timeZone) ? undefined : `${time.dateTime} does not exist in ${time.timeZone}`;
 }
 
+// Google keeps a timed endpoint as wall clock plus zone and reads a repeated wall time as its first occurrence
+function repeatedLocalTime(time: EventTime): string | undefined {
+  if ("date" in time || !time.timeZone || !hasOffset(time.dateTime)) return undefined;
+  const instant = new Date(time.dateTime);
+  const wall = toLocalISO(instant, time.timeZone);
+  const resolved = Date.parse(attachOffsetForTimezone(wall, time.timeZone));
+  return resolved === instant.getTime() - instant.getMilliseconds() ? undefined : `${time.dateTime} (${wall} in ${time.timeZone})`;
+}
+
 export function assertOrdered({ start, end }: TimePair): void {
+  const repeated = [start, end].map(repeatedLocalTime).filter(Boolean);
+  if (repeated.length > 0) {
+    fail(`${repeated.join(" and ")} falls in the second pass of an hour that clocks repeat when daylight saving time ends, and Google Calendar always reads that local time as its first pass. Pick a time outside the repeated hour.`);
+  }
   if (instantMs(end) > instantMs(start)) return;
   const skipped = [start, end].map(skippedLocalTime).filter(Boolean);
   if (skipped.length > 0) {

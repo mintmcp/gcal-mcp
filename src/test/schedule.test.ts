@@ -64,6 +64,22 @@ describe('assertOrdered', () => {
     })).toThrow(/2027-03-14T02:30:00 does not exist in America\/New_York/);
   });
 
+  it('rejects an endpoint on the second pass of a repeated hour, which Google would read as the first pass', () => {
+    const tz = 'America/New_York';
+    expect(() => assertOrdered({
+      start: { dateTime: '2026-11-01T01:30:00', timeZone: tz },
+      end: { dateTime: '2026-11-01T01:30:00-05:00', timeZone: tz },
+    })).toThrow(/2026-11-01T01:30:00-05:00 \(2026-11-01T01:30:00 in America\/New_York\) falls in the second pass/);
+    expect(() => assertOrdered({
+      start: { dateTime: '2026-11-01T01:00:00-04:00', timeZone: tz },
+      end: { dateTime: '2026-11-01T01:30:00-04:00', timeZone: tz },
+    })).not.toThrow();
+    expect(() => assertOrdered({
+      start: { dateTime: '2026-11-01T01:00:00-04:00' },
+      end: { dateTime: '2026-11-01T01:30:00-05:00' },
+    })).not.toThrow();
+  });
+
   it('accepts a gap time when the range still ends after it starts', () => {
     const tz = 'America/New_York';
     expect(() => assertOrdered({
@@ -90,15 +106,6 @@ describe('single-bound reschedules', () => {
     expect(await shiftedTimes(timed, start, zone('America/Recife'), zone('Europe/London'))).toEqual({
       start: { dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' },
       end: { dateTime: '2026-10-22T19:30:00+01:00', timeZone: 'Europe/London' },
-    });
-  });
-
-  it('pins the offset of a derived end that lands in the repeated fall-back hour', async () => {
-    const hour = { id: 'e', start: { dateTime: '2026-10-30T09:00:00-04:00' }, end: { dateTime: '2026-10-30T10:00:00-04:00' } };
-    const start = parseRange('2026-11-01T01:30:00', '2026-11-01T02:00:00').start;
-    expect((await shiftedTimes(hour, start, zone('America/New_York'), zone('America/New_York'))).end).toEqual({
-      dateTime: '2026-11-01T01:30:00-05:00',
-      timeZone: 'America/New_York',
     });
   });
 
