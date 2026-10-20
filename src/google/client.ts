@@ -1,8 +1,10 @@
 import { ToolFailure, fail, type FailurePayload } from "../lib/failure.js";
 import type { CalendarEvent } from "../lib/event-model.js";
+import type { Zone } from "../lib/schedule.js";
 
 const API_BASE = "https://www.googleapis.com/calendar/v3";
 const GOOGLE_FETCH_TIMEOUT_MS = 25_000;
+const MALFORMED_EVENT_TYPE_RE = /^malformed\w+Event$/;
 
 type GoogleFetchFailure = {
   ok: false;
@@ -117,7 +119,9 @@ export function mapGoogleError(result: GoogleFetchFailure, ctx: GoogleErrorConte
   const label = ctx.resource && ctx.resourceId ? `${ctx.resource} "${ctx.resourceId}"` : ctx.resource || "resource";
   switch (result.status) {
     case 400:
-      return permanent(`Invalid request to ${ctx.operation}: ${googleMessage || result.bodyText || "Google rejected the request as malformed."} Check parameter formats (ISO 8601 datetimes, valid timezone identifiers, time ranges).`);
+      return permanent(`Invalid request to ${ctx.operation}: ${googleMessage || result.bodyText || "Google rejected the request as malformed."}${
+        googleReason && MALFORMED_EVENT_TYPE_RE.test(googleReason) ? "" : " Check parameter formats (ISO 8601 datetimes, valid timezone identifiers, time ranges)."
+      }`);
     case 401:
       return permanent(`Authentication failed while trying to ${ctx.operation}. The user's Google session is invalid or expired and they need to re-authenticate. Do NOT retry; surface this to the user.`);
     case 403:
@@ -163,10 +167,15 @@ export interface RequestOptions {
   ifMatch?: string;
 }
 
+export interface CalendarInfo {
+  id?: string;
+  timeZone: string;
+}
+
 const MISSING_EVENT_ID = "Google returned an unexpected response with no event id.";
 
 export class CalendarClient {
-  private readonly zones = new Map<string, Promise<string>>();
+  private readonly calendars = new Map<string, Promise<CalendarInfo>>();
 
   constructor(private readonly accessToken: string) {}
 
@@ -194,10 +203,8 @@ export class CalendarClient {
   }
 
   async event(path: string, options: RequestOptions, ctx: GoogleErrorContext, missingIdError = MISSING_EVENT_ID): Promise<CalendarEvent> {
-    const res = await this.send(path, options);
-    if (!res.ok) throw new ToolFailure(mapGoogleError(res, ctx));
-    const event = res.bodyJson as CalendarEvent | undefined;
-    if (!event?.id) fail(missingIdError, { resource: ctx.resource, resourceId: ctx.resourceId, bodyText: truncateBody(res.bodyText) });
+    const event = await this.call<CalendarEvent>(path, options, ctx);
+    if (!event?.id) fail(missingIdError, { resource: ctx.resource, resourceId: ctx.resourceId, bodyText: truncateBody(event && JSON.stringify(event)) });
     return event;
   }
 
@@ -205,20 +212,23 @@ export class CalendarClient {
     return this.event(eventPath(calendarId, eventId), { query: { timeZone } }, { operation, resource: "event", resourceId: eventId });
   }
 
-  calendarTimeZone(calendarId: string): Promise<string> {
-    let zone = this.zones.get(calendarId);
-    if (!zone) {
-      zone = this.call<{ timeZone?: unknown }>(calendarPath(calendarId), {}, {
+  calendar(calendarId: string): Promise<CalendarInfo> {
+    let calendar = this.calendars.get(calendarId);
+    if (!calendar) {
+      calendar = this.call<{ id?: unknown; timeZone?: unknown }>(calendarPath(calendarId), {}, {
         operation: "read the calendar time zone (pass a time zone explicitly to skip this lookup)",
         resource: "calendar",
         resourceId: calendarId,
-      }).then((body) => (typeof body?.timeZone === "string" && body.timeZone ? body.timeZone : "UTC"));
-      this.zones.set(calendarId, zone);
+      }).then((body) => ({
+        ...(typeof body?.id === "string" && body.id && { id: body.id }),
+        timeZone: typeof body?.timeZone === "string" && body.timeZone ? body.timeZone : "UTC",
+      }));
+      this.calendars.set(calendarId, calendar);
     }
-    return zone;
+    return calendar;
   }
 
-  zone(calendarId: string, preferred?: string): () => Promise<string> {
-    return async () => preferred ?? this.calendarTimeZone(calendarId);
+  zone(calendarId: string, preferred?: string): Zone {
+    return async () => preferred ?? (await this.calendar(calendarId)).timeZone;
   }
 }

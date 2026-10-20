@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { eventsPath, type CalendarClient } from "../google/client.js";
-import { resolveInstant } from "../lib/datetime.js";
+import { parseBound, resolveInstant } from "../lib/datetime.js";
 import { eventSchema, toStructuredEvent, type EventsListResponse } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
 import { decodePageToken, encodePageToken, queryFingerprint } from "../lib/page-token.js";
-import { parseBound } from "../lib/schedule.js";
+import { EVENT_TYPES } from "../lib/event-options.js";
 import { READ_SCOPE, defineTool } from "./define.js";
 import { calendarIdSchema, timeZoneSchema } from "./schemas.js";
 
@@ -79,23 +79,23 @@ export const getCalendarEvents = defineTool({
     if (p.orderBy === "startTime" && !p.expandRecurring) {
       fail("Google can only order by startTime when recurring events are expanded. Use orderBy='updated' or expandRecurring=true.");
     }
-    const query = queryFingerprint({
-      calendarId: p.calendarId, q: p.q, eventTypes: p.eventTypes, orderBy: p.orderBy,
-      showDeleted: p.showDeleted, expandRecurring: p.expandRecurring, timeMin: p.timeMin, timeMax: p.timeMax,
-    });
+    const filters = {
+      singleEvents: String(p.expandRecurring),
+      orderBy: p.orderBy ?? (p.expandRecurring ? "startTime" : undefined),
+      ...(p.showDeleted && { showDeleted: "true" }),
+      eventTypes: p.eventTypes,
+      q: p.q,
+    };
+    const query = queryFingerprint({ calendarId: p.calendarId, ...filters, timeMin: p.timeMin, timeMax: p.timeMax });
     const cursor = p.pageToken === undefined ? undefined : decodePageToken(p.pageToken, query);
     const bounds = cursor ?? await resolveBounds(client, p);
 
     const data = await client.call<EventsListResponse>(eventsPath(p.calendarId), {
       query: {
+        ...filters,
         maxResults: String(p.maxResults),
-        singleEvents: String(p.expandRecurring),
-        orderBy: p.orderBy ?? (p.expandRecurring ? "startTime" : undefined),
-        showDeleted: p.showDeleted ? "true" : undefined,
-        eventTypes: p.eventTypes,
         pageToken: cursor?.googleToken,
         timeZone: p.timeZone,
-        q: p.q,
         timeMin: bounds.timeMin,
         timeMax: bounds.timeMax,
       },
@@ -115,13 +115,6 @@ export const getCalendarEvents = defineTool({
           : `No events found in calendar "${p.calendarId}" for the requested range`,
       };
     }
-    const events = items.flatMap((event) => {
-      try {
-        return [toStructuredEvent(event)];
-      } catch {
-        return [];
-      }
-    });
-    return { calendarId: p.calendarId, events, nextPageToken };
+    return { calendarId: p.calendarId, events: items.map(toStructuredEvent), nextPageToken };
   },
 });

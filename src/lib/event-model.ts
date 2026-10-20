@@ -1,20 +1,20 @@
 import { z } from "zod";
 import { formatDateTimeWithDay } from "./datetime.js";
 
-export interface ConferenceEntryPoint {
+export type ConferenceEntryPoint = {
   entryPointType: string;
   uri: string;
   label?: string;
-}
+};
 
-export interface ConferenceData {
+export type ConferenceData = {
   entryPoints?: ConferenceEntryPoint[];
   conferenceSolution?: {
     name?: string;
     iconUri?: string;
   };
   conferenceId?: string;
-}
+};
 
 export interface EventAttendee {
   email?: string;
@@ -295,7 +295,7 @@ export function toStructuredEvent(event: CalendarEvent) {
     ...(creator && { creator }),
     ...(typeof event.colorId === 'string' && { colorId: event.colorId }),
     ...(typeof event.visibility === 'string' && { visibility: event.visibility }),
-    availability: event.transparency === 'transparent' ? 'free' : 'busy',
+    availability: event.transparency === 'transparent' ? ('free' as const) : ('busy' as const),
     ...(typeof event.eventType === 'string' && { eventType: event.eventType }),
     ...(event.reminders && { reminders: event.reminders }),
     ...(typeof event.status === 'string' && { status: event.status }),

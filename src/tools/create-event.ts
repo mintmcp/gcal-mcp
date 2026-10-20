@@ -1,20 +1,13 @@
 import { z } from "zod";
 import { eventsPath } from "../google/client.js";
-import { buildEventOptions, normalizeAttachments, normalizeAttendees, validateEventTypeTimes, withEventTypeHint } from "../lib/event-fields.js";
+import { attachmentInputSchema, attachmentsDescription, normalizeAttachments } from "../lib/attachments.js";
+import { attendeeInputSchema, normalizeAttendees } from "../lib/attendees.js";
+import { buildEventOptions, eventOptionsInputSchema, eventTypeInputSchema, validateEventTypeTimes, withEventTypeHint } from "../lib/event-options.js";
 import { eventSchema, toStructuredEvent } from "../lib/event-model.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { assertOrdered, inZone, lacksNamedZone, parseRange, rangeTimes } from "../lib/schedule.js";
 import { WRITE_SCOPE, defineTool } from "./define.js";
-import {
-  attachmentInputSchema,
-  attachmentsDescription,
-  attendeeInputSchema,
-  calendarIdSchema,
-  eventOptionsInputSchema,
-  eventTypeInputSchema,
-  inputTimeZoneSchema,
-  sendUpdatesSchema,
-} from "./schemas.js";
+import { calendarIdSchema, inputTimeZoneSchema, sendUpdatesSchema } from "./schemas.js";
 
 export const createEvent = defineTool({
   name: "create_event",

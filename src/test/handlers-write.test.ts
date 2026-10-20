@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { GoogleCalendarTools } from '../tools.js';
 import {
   CALENDAR,
   GET_EVENT,
@@ -12,6 +11,7 @@ import {
   eventBody,
   only,
   run,
+  tool,
   stub,
   useGoogleStub,
 } from './harness.js';
@@ -196,7 +196,7 @@ describe('create_event attachments, event types and guest permissions', () => {
 
 describe('update_event', () => {
   it('is advertised as destructive, since it can remove guests and end a series', () => {
-    expect((GoogleCalendarTools.getTools() as any).update_event.destructiveHint).toBe(true);
+    expect(tool('update_event').destructiveHint).toBe(true);
   });
 
   it('adds and removes attendees without resetting everyone else', async () => {
@@ -254,11 +254,11 @@ describe('update_event', () => {
 
   it('patches event options and a Meet link request without reading the event first', async () => {
     stub(PATCH_EVENT, eventBody);
-    await run('update_event', { eventId: 'ev1', colorId: '2', availability: 'busy', addGoogleMeet: true });
+    await run('update_event', { eventId: 'ev1', colorId: '2', addGoogleMeet: true });
     const { url, body } = only(PATCH_EVENT);
     expect(calls).toHaveLength(1);
     expect(url.searchParams.get('conferenceDataVersion')).toBe('1');
-    expect(body).toMatchObject({ colorId: '2', transparency: 'opaque' });
+    expect(body).toMatchObject({ colorId: '2' });
     expect(body.conferenceData.createRequest.conferenceSolutionKey).toEqual({ type: 'hangoutsMeet' });
   });
 
@@ -355,77 +355,6 @@ describe('update_event', () => {
   });
 });
 
-describe('update_event reschedule with one bound', () => {
-  it('moves the start and keeps the duration when only a new start is given, guarded by the etag it read', async () => {
-    stub(GET_EVENT, { ...eventBody, etag: '"e9"' });
-    stub(CALENDAR, calendarBody);
-    stub(PATCH_EVENT, eventBody);
-    await run('update_event', { eventId: 'ev1', start: '2026-10-22T15:00:00' });
-    const patch = only(PATCH_EVENT);
-    expect(patch.headers['If-Match']).toBe('"e9"');
-    expect(patch.body.start).toEqual({ dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife', date: null });
-    expect(patch.body.end).toEqual({ dateTime: '2026-10-22T15:30:00', timeZone: 'America/Recife', date: null });
-  });
-
-  it('keeps a new end when making an offset-only event recurring in the same call', async () => {
-    stub(GET_EVENT, eventBody);
-    stub(CALENDAR, calendarBody);
-    stub(PATCH_EVENT, eventBody);
-    await run('update_event', { eventId: 'ev1', end: '2026-10-20T11:00:00-03:00', recurrence: ['RRULE:FREQ=WEEKLY'] });
-    const { body } = only(PATCH_EVENT);
-    expect(body.start).toMatchObject({ dateTime: '2026-10-20T10:00:00-03:00', timeZone: 'America/Recife' });
-    expect(body.end).toMatchObject({ dateTime: '2026-10-20T11:00:00-03:00', timeZone: 'America/Recife' });
-  });
-
-  it('uses the zone the event already stores for a start-only move', async () => {
-    stub(GET_EVENT, { ...eventBody, start: { ...eventBody.start, timeZone: 'Europe/Lisbon' }, end: { ...eventBody.end, timeZone: 'Europe/Lisbon' } });
-    stub(PATCH_EVENT, eventBody);
-    await run('update_event', { eventId: 'ev1', start: '2026-10-22T15:00:00-03:00' });
-    expect(calls).toHaveLength(2);
-    const { body } = only(PATCH_EVENT);
-    expect(body.start).toMatchObject({ dateTime: '2026-10-22T15:00:00-03:00', timeZone: 'Europe/Lisbon' });
-    expect(body.end).toMatchObject({ dateTime: '2026-10-22T19:30:00', timeZone: 'Europe/Lisbon' });
-  });
-
-  it('shifts an all-day event by whole days when only a new start date is given', async () => {
-    stub(GET_EVENT, { ...eventBody, start: { date: '2026-10-20' }, end: { date: '2026-10-22' } });
-    stub(PATCH_EVENT, eventBody);
-    await run('update_event', { eventId: 'ev1', start: '2026-11-01' });
-    const { body } = only(PATCH_EVENT);
-    expect(body.start).toMatchObject({ date: '2026-11-01' });
-    expect(body.end).toMatchObject({ date: '2026-11-03' });
-  });
-
-  it('changes only the end when only a new end is given', async () => {
-    stub(GET_EVENT, eventBody);
-    stub(CALENDAR, calendarBody);
-    stub(PATCH_EVENT, eventBody);
-    await run('update_event', { eventId: 'ev1', end: '2026-10-20T11:00:00' });
-    const { body } = only(PATCH_EVENT);
-    expect(body).not.toHaveProperty('start');
-    expect(body.end).toEqual({ dateTime: '2026-10-20T11:00:00', timeZone: 'America/Recife', date: null });
-  });
-
-  it('refuses an end that lands on the start because its local time was skipped', async () => {
-    stub(GET_EVENT, {
-      ...eventBody,
-      start: { dateTime: '2027-03-14T03:30:00-04:00', timeZone: 'America/New_York' },
-      end: { dateTime: '2027-03-14T04:00:00-04:00', timeZone: 'America/New_York' },
-    });
-    const res = await run('update_event', { eventId: 'ev1', end: '2027-03-14T02:30:00' });
-    expect(res.isError).toBe(true);
-    expect(errorOf(res).error).toMatch(/2027-03-14T02:30:00 does not exist/);
-    expect(callsTo(PATCH_EVENT)).toHaveLength(0);
-  });
-
-  it('refuses to turn a timed event all-day with a lone start date', async () => {
-    stub(GET_EVENT, eventBody);
-    const res = await run('update_event', { eventId: 'ev1', start: '2026-11-01' });
-    expect(res.isError).toBe(true);
-    expect(calls).toHaveLength(1);
-  });
-});
-
 describe('update_event attachments', () => {
   it('adds and removes attachments without touching the rest', async () => {
     stub(GET_EVENT, {
@@ -515,5 +444,26 @@ describe('respond_to_event', () => {
     const res = await run('respond_to_event', { eventId: 'ev1', responseStatus: 'tentative' });
     expect(callsTo(PATCH_EVENT)).toHaveLength(0);
     expect(res.structuredContent.message).toMatch(/already tentative/);
+  });
+
+  it('identifies you by your primary calendar address on a shared calendar', async () => {
+    const shared = 'GET /calendar/v3/calendars/team%40example.com/events/ev1';
+    stub(CALENDAR, calendarBody);
+    stub(shared, { ...invited, attendees: [{ email: 'owner@example.com', self: true }, { email: 'Joao@Example.com', responseStatus: 'needsAction' }] });
+    stub('PATCH /calendar/v3/calendars/team%40example.com/events/ev1', invited);
+    await run('respond_to_event', { calendarId: 'team@example.com', eventId: 'ev1', responseStatus: 'accepted', sendUpdates: 'none' });
+    expect(callsTo(CALENDAR)).toHaveLength(1);
+    expect(calls.at(-1)!.body.attendees).toEqual([
+      { email: 'owner@example.com', self: true },
+      { email: 'Joao@Example.com', responseStatus: 'accepted' },
+    ]);
+  });
+
+  it('refuses to guess on a shared calendar when your address cannot be read', async () => {
+    stub(CALENDAR, { error: { message: 'nope' } }, 403);
+    stub('GET /calendar/v3/calendars/team%40example.com/events/ev1', invited);
+    const res = await run('respond_to_event', { calendarId: 'team@example.com', eventId: 'ev1', responseStatus: 'accepted' });
+    expect(res.isError).toBe(true);
+    expect(errorOf(res).error).toMatch(/email address could not be determined/);
   });
 });

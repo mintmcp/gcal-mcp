@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   assertOrdered,
-  endOnlyTime,
+  endOnlyTimes,
   inZone,
   lacksNamedZone,
   parseRange,
   parseReschedule,
   rangeTimes,
+  relabel,
   shiftedTimes,
   toPatchTime,
 } from '../lib/schedule.js';
@@ -77,23 +78,50 @@ describe('single-bound reschedules', () => {
 
   it('keeps the duration when only the start moves', async () => {
     const start = parseRange('2026-10-22T15:00:00', '2026-10-22T16:00:00').start;
-    expect(await shiftedTimes(timed, start, zone('America/Recife'))).toEqual({
+    expect(await shiftedTimes(timed, start, zone('America/Recife'), zone('America/Recife'))).toEqual({
       start: { dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' },
       end: { dateTime: '2026-10-22T15:30:00', timeZone: 'America/Recife' },
     });
   });
 
-  it('refuses a lone bound of the other kind', async () => {
-    const date = parseRange('2026-11-01', '2026-11-02').start;
-    await expect(shiftedTimes(timed, date, noZone)).rejects.toThrow(/timed event/);
-    const dt = parseRange('2026-11-01T10:00:00Z', '2026-11-01T11:00:00Z').end;
-    await expect(endOnlyTime(allDay, dt, undefined, noZone)).rejects.toThrow(/all-day event/);
+  it('reads a naive start in the input zone and writes the derived end in the end zone', async () => {
+    const start = parseRange('2026-10-22T15:00:00', '2026-10-22T16:00:00').start;
+    expect(await shiftedTimes(timed, start, zone('America/Recife'), zone('Europe/London'))).toEqual({
+      start: { dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' },
+      end: { dateTime: '2026-10-22T19:30:00', timeZone: 'Europe/London' },
+    });
   });
 
-  it('only looks up a zone for a naive end with no preferred zone', async () => {
+  it('refuses a lone bound of the other kind', async () => {
+    const date = parseRange('2026-11-01', '2026-11-02').start;
+    await expect(shiftedTimes(timed, date, noZone, noZone)).rejects.toThrow(/timed event/);
+    const dt = parseRange('2026-11-01T10:00:00Z', '2026-11-01T11:00:00Z').end;
+    await expect(endOnlyTimes(allDay, dt, noZone)).rejects.toThrow(/all-day event/);
+  });
+
+  it('keeps the stored start for an end-only change and only looks up a zone for a naive end', async () => {
     const offsetEnd = parseRange('2026-10-20T10:00:00Z', '2026-10-20T11:00:00-03:00').end;
-    expect(await endOnlyTime(timed, offsetEnd, undefined, noZone)).toEqual({ dateTime: '2026-10-20T11:00:00-03:00' });
-    expect(await endOnlyTime(timed, offsetEnd, 'Europe/Lisbon', noZone)).toEqual({ dateTime: '2026-10-20T11:00:00-03:00', timeZone: 'Europe/Lisbon' });
+    expect(await endOnlyTimes(timed, offsetEnd, noZone)).toEqual({
+      start: { dateTime: '2026-10-20T10:00:00-03:00' },
+      end: { dateTime: '2026-10-20T11:00:00-03:00' },
+    });
+    const naiveEnd = parseRange('2026-10-20T10:00:00', '2026-10-20T11:00:00').end;
+    expect((await endOnlyTimes(timed, naiveEnd, zone('America/Recife'))).end).toEqual({ dateTime: '2026-10-20T11:00:00', timeZone: 'America/Recife' });
+  });
+});
+
+describe('relabel', () => {
+  it('keeps the instant while naming the requested zone', () => {
+    expect(relabel({ dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' }, 'America/New_York'))
+      .toEqual({ dateTime: '2026-10-22T15:00:00-03:00', timeZone: 'America/New_York' });
+    expect(relabel({ dateTime: '2026-10-22T15:00:00Z' }, 'Europe/Lisbon')).toEqual({ dateTime: '2026-10-22T15:00:00Z', timeZone: 'Europe/Lisbon' });
+  });
+
+  it('leaves dates, matching zones and missing labels alone', () => {
+    const naive = { dateTime: '2026-10-22T15:00:00', timeZone: 'UTC' };
+    expect(relabel(naive, 'UTC')).toBe(naive);
+    expect(relabel(naive, undefined)).toBe(naive);
+    expect(relabel({ date: '2026-10-22' }, 'UTC')).toEqual({ date: '2026-10-22' });
   });
 });
 

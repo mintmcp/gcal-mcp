@@ -222,6 +222,16 @@ describe('get_calendar_events pagination', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('treats showDeleted false and omitted as the same listing when continuing', async () => {
+    stub(LIST_EVENTS, { items: [eventBody], nextPageToken: 'g-token' });
+    stub(LIST_EVENTS, { items: [] });
+    const first = await run('get_calendar_events', { timeMin: '2026-10-20T00:00:00Z', showDeleted: false });
+    const res = await run('get_calendar_events', { timeMin: '2026-10-20T00:00:00Z', pageToken: first.structuredContent.nextPageToken });
+    expect(res.isError).toBeUndefined();
+    expect(callsTo(LIST_EVENTS)[1].url.searchParams.get('pageToken')).toBe('g-token');
+    expect(callsTo(LIST_EVENTS)[1].url.searchParams.has('showDeleted')).toBe(false);
+  });
+
   it('rejects a token reused with a different query instead of returning an empty page', async () => {
     stub(LIST_EVENTS, { items: [eventBody], nextPageToken: 'g-token' });
     const first = await run('get_calendar_events', { q: 'sync' });

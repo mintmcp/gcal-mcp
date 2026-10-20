@@ -1,14 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import {
-  buildEventOptions,
-  describeAttendeeRoster,
-  mergeAttachments,
-  mergeAttendees,
-  normalizeAttachments,
-  normalizeAttendees,
-  validateEventTypeTimes,
-  withEventTypeHint,
-} from '../lib/event-fields.js';
+import { z } from 'zod';
+import { mergeAttachments, normalizeAttachments } from '../lib/attachments.js';
+import { attendeeInputSchema, describeAttendeeRoster, emailSchema, mergeAttendees, normalizeAttendees } from '../lib/attendees.js';
+import { buildEventOptions, validateEventTypeTimes, withEventTypeHint } from '../lib/event-options.js';
 import type { EventAttendee } from '../lib/event-model.js';
 import { ToolFailure } from '../lib/failure.js';
 
@@ -163,10 +157,9 @@ describe('buildEventOptions guest permissions and event types', () => {
     expect(() => buildEventOptions({ eventType: 'workingLocation', availability: 'busy' })).toThrow(/free/);
   });
 
-  it('accepts a custom working location without a label and defaults to home office', () => {
-    expect(buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation' } })).toMatchObject({
-      workingLocationProperties: { type: 'customLocation', customLocation: {} },
-    });
+  it('requires a label for a custom working location, as Google does, and defaults to home office', () => {
+    expect(() => buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation' } })).toThrow(/label/);
+    expect(() => buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation', label: '  ' } })).toThrow(/label/);
     expect(buildEventOptions({ eventType: 'workingLocation' })).toMatchObject({
       workingLocationProperties: { type: 'homeOffice', homeOffice: {} },
     });
@@ -284,6 +277,15 @@ describe('validateEventTypeTimes', () => {
 });
 
 describe('withEventTypeHint', () => {
+  it('names only the rules of the event type involved', () => {
+    const bad = new ToolFailure({ error: 'Invalid request', status: 400 });
+    const focus = (withEventTypeHint(bad, 'focusTime') as ToolFailure).payload.hint;
+    expect(focus).toBe('focusTime events: only accepted on the user\'s primary calendar (calendarId "primary"); must be timed, not all-day; always busy.');
+    const office = (withEventTypeHint(bad, 'workingLocation') as ToolFailure).payload.hint;
+    expect(office).toMatch(/exactly one day; always free and public/);
+    expect(office).not.toMatch(/timed/);
+  });
+
   it('adds the event type rules to a 400 for a special event type only', () => {
     const bad = new ToolFailure({ error: 'Invalid request', status: 400 });
     const hinted = withEventTypeHint(bad, 'outOfOffice') as ToolFailure;
@@ -298,5 +300,29 @@ describe('withEventTypeHint', () => {
 describe('describeAttendeeRoster', () => {
   it('summarises the roster without listing everyone', () => {
     expect(describeAttendeeRoster([{ email: 'a@x.com' }, { email: 'b@x.com' }], 1)).toBe('2 attendee(s), e.g. a@x.com and 1 more');
+  });
+});
+
+describe('emailSchema', () => {
+  const unusual = ['a&b@x.com', 'user@xn--p1ai.xn--p1ai', 'joão@x.com', 'customer/department=shipping@example.com', "o'brien@example.com"];
+
+  it('accepts addresses Google accepts, trimming whitespace around them', () => {
+    for (const email of unusual) expect(emailSchema.parse(` ${email} `)).toBe(email);
+  });
+
+  it('rejects strings that are not shaped like one address', () => {
+    for (const bad of ['', '   ', 'no-at-sign', '@example.com', 'user@', 'a@b@example.com', 'two words@example.com']) {
+      expect(emailSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+
+  it('publishes no pattern or format that a client would enforce before Google sees the address', () => {
+    const json = JSON.stringify(z.toJSONSchema(z.object({ email: emailSchema, attendee: attendeeInputSchema })));
+    expect(json).not.toMatch(/"pattern"|"format"/);
+  });
+
+  it('removes attendees with unusual addresses, matching case-insensitively', () => {
+    const existing = unusual.map(email => ({ email }));
+    expect(mergeAttendees(existing, [], unusual.map(e => e.toUpperCase()))).toEqual([]);
   });
 });

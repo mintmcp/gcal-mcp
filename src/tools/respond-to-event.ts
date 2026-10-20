@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { calendarPath, eventPath, type CalendarClient } from "../google/client.js";
-import { describeAttendeeRoster } from "../lib/event-fields.js";
+import { eventPath, type CalendarClient } from "../google/client.js";
+import { describeAttendeeRoster } from "../lib/attendees.js";
 import { eventSchema, toStructuredEvent, type CalendarEvent, type EventAttendee } from "../lib/event-model.js";
 import { ToolFailure, fail } from "../lib/failure.js";
 import { WRITE_SCOPE, defineTool } from "./define.js";
@@ -29,10 +29,8 @@ export function identifyCallerAttendee(
   return byEmail ? { kind: "found", attendee: byEmail } : { kind: "notFound" };
 }
 
-async function resolveCallerEmail(client: CalendarClient): Promise<string | undefined> {
-  const res = await client.send(calendarPath("primary"));
-  const id = res.ok ? (res.bodyJson as { id?: unknown } | undefined)?.id : undefined;
-  return typeof id === "string" && id.length > 0 ? id.toLowerCase() : undefined;
+function resolveCallerEmail(client: CalendarClient): Promise<string | undefined> {
+  return client.calendar("primary").then(({ id }) => id?.toLowerCase(), () => undefined);
 }
 
 function rsvpResult(event: CalendarEvent, myResponseStatus: string, message: string, myComment: string | undefined) {
@@ -128,19 +126,15 @@ export const respondToEvent = defineTool({
         fail(`Event "${eventId}" is being changed by someone else right now, so your response was not saved (retrying immediately would risk overwriting their change). Try again in a moment.`, eventRef);
       }
 
-      try {
-        const stored = identifyCallerAttendee(updated.attendees ?? [], email, calendarId);
-        const storedStatus = stored.kind === "found" ? stored.attendee.responseStatus : undefined;
-        const eventName = updated.summary || eventId;
-        const message = !storedStatus
-          ? `Your ${responseStatus} response to "${eventName}" was submitted, but Google's reply did not include your attendee entry, so the stored value could not be confirmed.`
-          : storedStatus !== responseStatus
-            ? `Your response to "${eventName}" was submitted as ${responseStatus}, but Google reports it as ${storedStatus}.`
-            : `Your response to "${eventName}" was set to ${storedStatus}.`;
-        return rsvpResult(updated, storedStatus || "unknown", message, stored.kind === "found" ? stored.attendee.comment : undefined);
-      } catch (err) {
-        fail(submittedButUnconfirmed(responseStatus, eventId, `the confirmation could not be read: ${err instanceof Error ? err.message : String(err)}`), eventRef);
-      }
+      const stored = identifyCallerAttendee(updated.attendees ?? [], email, calendarId);
+      const storedStatus = stored.kind === "found" ? stored.attendee.responseStatus : undefined;
+      const eventName = updated.summary || eventId;
+      const message = !storedStatus
+        ? `Your ${responseStatus} response to "${eventName}" was submitted, but Google's reply did not include your attendee entry, so the stored value could not be confirmed.`
+        : storedStatus !== responseStatus
+          ? `Your response to "${eventName}" was submitted as ${responseStatus}, but Google reports it as ${storedStatus}.`
+          : `Your response to "${eventName}" was set to ${storedStatus}.`;
+      return rsvpResult(updated, storedStatus || "unknown", message, stored.kind === "found" ? stored.attendee.comment : undefined);
     }
   },
 });

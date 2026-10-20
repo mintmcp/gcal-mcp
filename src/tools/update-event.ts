@@ -1,40 +1,27 @@
 import { z } from "zod";
 import { eventPath, type CalendarClient } from "../google/client.js";
-import {
-  buildEventOptions,
-  mergeAttachments,
-  mergeAttendees,
-  normalizeAttachments,
-  normalizeAttendees,
-  validateEventTypeTimes,
-  withEventTypeHint,
-} from "../lib/event-fields.js";
+import { attachmentInputSchema, mergeAttachments, normalizeAttachments } from "../lib/attachments.js";
+import { attendeeInputSchema, emailSchema, mergeAttendees, normalizeAttendees } from "../lib/attendees.js";
+import { assertEventTypeOptions, buildEventOptions, eventOptionsInputSchema, validateEventTypeTimes, withEventTypeHint } from "../lib/event-options.js";
 import { eventSchema, toStructuredEvent, type CalendarEvent, type EventAttachment } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import {
   assertOrdered,
-  endOnlyTime,
-  inZone,
+  endOnlyTimes,
   lacksNamedZone,
   parseReschedule,
   rangeTimes,
+  relabel,
   shiftedTimes,
-  storedTime,
+  storedTimes,
   toPatchTime,
   type Reschedule,
   type TimePair,
+  type Zone,
 } from "../lib/schedule.js";
 import { WRITE_SCOPE, defineTool } from "./define.js";
-import {
-  attachmentInputSchema,
-  attendeeInputSchema,
-  calendarIdSchema,
-  emailSchema,
-  eventOptionsInputSchema,
-  inputTimeZoneSchema,
-  sendUpdatesSchema,
-} from "./schemas.js";
+import { calendarIdSchema, inputTimeZoneSchema, sendUpdatesSchema } from "./schemas.js";
 
 const schema = {
   calendarId: calendarIdSchema('Calendar containing the event. Defaults to "primary".'),
@@ -78,39 +65,53 @@ function assertExclusive(p: UpdateArgs, replace: keyof UpdateArgs, ...incrementa
   }
 }
 
-async function changedTimes(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, client: CalendarClient): Promise<Partial<TimePair>> {
-  const preferredZone = p.timeZone ?? current.start?.timeZone;
-  switch (reschedule?.kind) {
+type ZoneLabels = { start?: string; end?: string };
+
+function changedTimes(reschedule: Reschedule, current: CalendarEvent, inputZone: Zone, endZone: Zone): Promise<TimePair> {
+  switch (reschedule.kind) {
     case "range":
-      return rangeTimes(reschedule.range, client.zone(p.calendarId, p.timeZone));
+      return rangeTimes(reschedule.range, inputZone);
     case "start":
-      return shiftedTimes(current, reschedule.start, client.zone(p.calendarId, preferredZone));
+      return shiftedTimes(current, reschedule.start, inputZone, endZone);
     case "end":
-      return { end: await endOnlyTime(current, reschedule.end, preferredZone, client.zone(p.calendarId)) };
-    default:
-      return {};
+      return endOnlyTimes(current, reschedule.end, inputZone);
   }
 }
 
-async function schedulePatch(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, client: CalendarClient) {
-  const changed = await changedTimes(p, reschedule, current, client);
-  const start = changed.start ?? storedTime(current.start);
-  const end = changed.end ?? storedTime(current.end);
-  if (!start || !end) return {};
-  const recurring = p.recurrence !== undefined ? p.recurrence.length > 0 : (current.recurrence?.length ?? 0) > 0;
-  const rezoned = recurring && lacksNamedZone({ start, end })
-    ? inZone({ start, end }, p.timeZone ?? current.start?.timeZone ?? await client.calendarTimeZone(p.calendarId))
-    : undefined;
-  if (reschedule) {
-    const times = rezoned ?? { start, end };
-    validateEventTypeTimes(current.eventType, times);
-    assertOrdered(times);
+async function zoneLabels(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, recurring: boolean, client: CalendarClient): Promise<ZoneLabels> {
+  if (recurring) {
+    const zone = p.timeZone ?? current.start?.timeZone ?? await client.zone(p.calendarId)();
+    return { start: zone, end: zone };
   }
-  const patch = rezoned ?? changed;
   return {
-    ...(patch.start && { start: toPatchTime(patch.start) }),
-    ...(patch.end && { end: toPatchTime(patch.end) }),
+    start: reschedule?.kind === "end" ? current.start?.timeZone : p.timeZone ?? current.start?.timeZone,
+    end: p.timeZone ?? current.end?.timeZone,
   };
+}
+
+async function schedulePatch(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, client: CalendarClient) {
+  const stored = storedTimes(current);
+  const recurring = p.recurrence !== undefined ? p.recurrence.length > 0 : (current.recurrence?.length ?? 0) > 0;
+  if (!reschedule && !(recurring && stored && lacksNamedZone(stored))) return {};
+  const timed = reschedule?.kind === "range" ? reschedule.range.kind === "datetime" : current.start?.dateTime !== undefined;
+  const labels = timed ? await zoneLabels(p, reschedule, current, recurring, client) : {};
+  const inputZone = client.zone(p.calendarId, p.timeZone);
+  const times = reschedule ? await changedTimes(reschedule, current, inputZone, async () => labels.end ?? await inputZone()) : stored;
+  if (!times) return {};
+  validateEventTypeTimes(current.eventType, times);
+  assertOrdered(times);
+  return { start: toPatchTime(relabel(times.start, labels.start)), end: toPatchTime(relabel(times.end, labels.end)) };
+}
+
+async function loadCurrent(client: CalendarClient, calendarId: string, eventId: string): Promise<CalendarEvent> {
+  const current = await client.getEvent(calendarId, eventId, "load event before updating");
+  if (current.status === "cancelled") {
+    fail(`Event "${eventId}" was cancelled and no longer exists, so it cannot be updated. If it is an occurrence of a recurring series, list the series instances again (get_calendar_events) and use a current occurrence id.`, {
+      resource: "event",
+      resourceId: eventId,
+    });
+  }
+  return current;
 }
 
 function attendeePatch(p: UpdateArgs, current: CalendarEvent) {
@@ -135,6 +136,7 @@ export const updateEvent = defineTool({
     "Patch fields on an existing Google Calendar event by `eventId`. " +
     "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
     "To reschedule, pass `start` and/or `end` as ISO 8601: date-only for all-day, datetime for timed. With only `start`, the event moves and keeps its duration; with only `end`, just the end changes. Pass neither to leave the schedule unchanged; pass both to change the kind (timed <-> all-day). The resulting `end` must be after `start`. " +
+    "Naive datetimes are read in `timeZone`, else the calendar's own time zone. Each endpoint keeps the time zone it already has unless `timeZone` is passed; a recurring series keeps one shared time zone. " +
     "`description` is rendered through Markdown to HTML by the server. " +
     "To add or remove guests, use `addAttendees` / `removeAttendees`: everyone else keeps their current response; removing someone who is not a guest is an error. " +
     "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead: it preserves everyone else's responses. " +
@@ -155,8 +157,9 @@ export const updateEvent = defineTool({
 
     const needsCurrent = reschedule !== undefined
       || (p.recurrence?.length ?? 0) > 0
-      || [p.addAttendees, p.removeAttendees, p.addAttachments, p.removeAttachments].some((v) => v !== undefined);
-    const current = needsCurrent ? await client.getEvent(p.calendarId, p.eventId, "load event before updating") : undefined;
+      || [p.addAttendees, p.removeAttendees, p.addAttachments, p.removeAttachments, p.availability, p.visibility].some((v) => v !== undefined);
+    const current = needsCurrent ? await loadCurrent(client, p.calendarId, p.eventId) : undefined;
+    if (current) assertEventTypeOptions(current.eventType, p);
 
     const patch = {
       ...options,

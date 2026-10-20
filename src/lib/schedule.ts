@@ -1,4 +1,4 @@
-import { attachOffsetForTimezone, localTimeExists, parseIso, toInstant, toLocalISO, type ParsedIso } from "./datetime.js";
+import { attachOffsetForTimezone, hasOffset, localTimeExists, parseBound, toLocalISO, type ParsedIso } from "./datetime.js";
 import { fail } from "./failure.js";
 import type { CalendarEvent, EventDateTime } from "./event-model.js";
 
@@ -17,10 +17,6 @@ export type Reschedule =
   | { kind: "range"; range: ParsedRange }
   | { kind: "start"; start: ParsedIso }
   | { kind: "end"; end: ParsedIso };
-
-export function parseBound(name: string, value: string): ParsedIso {
-  return parseIso(value) ?? fail(`Invalid \`${name}\` "${value}". Expected ISO 8601: YYYY-MM-DD, YYYY-MM-DDTHH:MM[:SS], or with Z/offset.`);
-}
 
 export function parseRange(start: string, end: string): ParsedRange {
   const s = parseBound("start", start);
@@ -55,8 +51,6 @@ export function inZone({ start, end }: TimePair, timeZone: string): TimePair {
   return { start: { ...start, timeZone }, end: { ...end, timeZone } };
 }
 
-const hasOffset = (dateTime: string) => /(?:Z|[+-]\d{2}:\d{2})$/.test(dateTime);
-
 function instantMs(time: EventTime): number {
   if ("date" in time) return Date.parse(`${time.date}T00:00:00Z`);
   if (hasOffset(time.dateTime) || !time.timeZone) return Date.parse(time.dateTime);
@@ -77,17 +71,20 @@ export function assertOrdered({ start, end }: TimePair): void {
   fail("`end` must be after `start`.", { start, end });
 }
 
-export function storedTime(time: EventDateTime | undefined): EventTime | undefined {
+function storedTime(time: EventDateTime | undefined): EventTime | undefined {
   if (time?.dateTime) return { dateTime: time.dateTime, ...(time.timeZone && { timeZone: time.timeZone }) };
   if (time?.date) return { date: time.date };
   return undefined;
 }
 
-function storedDurationMs(event: CalendarEvent): number {
+export function storedTimes(event: CalendarEvent): TimePair | undefined {
   const start = storedTime(event.start);
   const end = storedTime(event.end);
-  const ms = start && end && "date" in start === "date" in end ? instantMs(end) - instantMs(start) : NaN;
-  return Number.isFinite(ms) ? ms : fail("The event has no stored start/end to derive a duration from; pass both `start` and `end`.");
+  return start && end ? { start, end } : undefined;
+}
+
+function requireStored(event: CalendarEvent): TimePair {
+  return storedTimes(event) ?? fail("The event has no stored start/end to reschedule from; pass both `start` and `end`.");
 }
 
 function assertSameKind(current: CalendarEvent, bound: ParsedIso, name: "start" | "end"): void {
@@ -99,23 +96,32 @@ function assertSameKind(current: CalendarEvent, bound: ParsedIso, name: "start" 
   }
 }
 
-export async function shiftedTimes(current: CalendarEvent, start: ParsedIso, eventZone: Zone): Promise<TimePair> {
-  const durationMs = storedDurationMs(current);
-  assertSameKind(current, start, "start");
-  if (start.kind === "date") {
-    const endDate = new Date(Date.parse(`${start.date}T00:00:00Z`) + durationMs).toISOString().slice(0, 10);
-    return { start: { date: start.date }, end: { date: endDate } };
-  }
-  const timeZone = await eventZone();
-  const endLocal = toLocalISO(new Date(Date.parse(toInstant(start, timeZone)) + durationMs), timeZone);
-  return { start: { dateTime: start.rfc3339, timeZone }, end: { dateTime: endLocal, timeZone } };
+async function pinnedTime(bound: ParsedIso, zone: Zone): Promise<EventTime> {
+  if (bound.kind === "date") return { date: bound.date };
+  return bound.hasOffset ? { dateTime: bound.rfc3339 } : { dateTime: bound.rfc3339, timeZone: await zone() };
 }
 
-export async function endOnlyTime(current: CalendarEvent, end: ParsedIso, preferredZone: string | undefined, calendarZone: Zone): Promise<EventTime> {
+export async function shiftedTimes(current: CalendarEvent, start: ParsedIso, inputZone: Zone, endZone: Zone): Promise<TimePair> {
+  const stored = requireStored(current);
+  const durationMs = instantMs(stored.end) - instantMs(stored.start);
+  assertSameKind(current, start, "start");
+  const newStart = await pinnedTime(start, inputZone);
+  const endMs = instantMs(newStart) + durationMs;
+  if ("date" in newStart) return { start: newStart, end: { date: new Date(endMs).toISOString().slice(0, 10) } };
+  const timeZone = await endZone();
+  return { start: newStart, end: { dateTime: toLocalISO(new Date(endMs), timeZone), timeZone } };
+}
+
+export async function endOnlyTimes(current: CalendarEvent, end: ParsedIso, inputZone: Zone): Promise<TimePair> {
+  const stored = requireStored(current);
   assertSameKind(current, end, "end");
-  if (end.kind === "date") return { date: end.date };
-  const timeZone = preferredZone ?? (end.hasOffset ? undefined : await calendarZone());
-  return { dateTime: end.rfc3339, ...(timeZone && { timeZone }) };
+  return { start: stored.start, end: await pinnedTime(end, inputZone) };
+}
+
+export function relabel(time: EventTime, label: string | undefined): EventTime {
+  if ("date" in time || !label || time.timeZone === label) return time;
+  const dateTime = hasOffset(time.dateTime) || !time.timeZone ? time.dateTime : attachOffsetForTimezone(time.dateTime, time.timeZone);
+  return { dateTime, timeZone: label };
 }
 
 // PATCH merges start/end objects, so a kind switch must null the other kind's fields

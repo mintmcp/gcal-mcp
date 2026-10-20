@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { truncateBody } from '../google/client.js';
-import { describeAttendeeRoster } from '../lib/event-fields.js';
+import { mapGoogleError, truncateBody } from '../google/client.js';
+import { describeAttendeeRoster } from '../lib/attendees.js';
 import { identifyCallerAttendee } from '../tools/respond-to-event.js';
 import { toStructuredEvent } from '../lib/event-model.js';
 
@@ -25,6 +25,25 @@ describe('describeAttendeeRoster', () => {
   it('ignores rows without a string email', () => {
     const attendees = [{ email: undefined as unknown as string }, { email: 'real@example.com' }];
     expect(describeAttendeeRoster(attendees)).toBe('2 attendee(s), e.g. real@example.com');
+  });
+});
+
+describe('mapGoogleError', () => {
+  const badRequest = (reason: string) => mapGoogleError(
+    { ok: false, kind: 'http', status: 400, statusText: 'Bad Request', bodyText: '', bodyJson: { error: { message: 'Bad thing.', errors: [{ reason }] } } },
+    { operation: 'create calendar event' },
+  );
+
+  it('keeps the format advice for a generic bad request', () => {
+    expect(badRequest('badRequest').error).toMatch(/Bad thing\. Check parameter formats/);
+  });
+
+  it('drops the format advice when Google names a malformed special event', () => {
+    for (const reason of ['malformedWorkingLocationEvent', 'malformedFocusTimeEvent', 'malformedOutOfOfficeEvent']) {
+      const payload = badRequest(reason);
+      expect(payload.error).toBe('Invalid request to create calendar event: Bad thing.');
+      expect(payload.googleReason).toBe(reason);
+    }
   });
 });
 

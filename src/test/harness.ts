@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { z } from 'zod';
 import { requestContext } from '../auth.js';
-import { GoogleCalendarTools } from '../tools.js';
+import { TOOLS } from '../tools/index.js';
 
 type Call = { route: string; url: URL; method: string; headers: Record<string, string>; body?: any };
 
@@ -50,10 +49,21 @@ function stubFetch() {
   });
 }
 
-export async function run(tool: string, args: Record<string, unknown>) {
-  const t = (GoogleCalendarTools.getTools() as any)[tool];
-  const parsed = z.object(t.schema).parse(args);
-  return requestContext.run({ accessToken: 'token' }, () => t.handler(parsed));
+export function tool(name: string) {
+  const found = TOOLS.find(t => t.name === name);
+  if (!found) throw new Error(`unknown tool ${name}`);
+  return found;
+}
+
+interface TestResult {
+  isError?: boolean;
+  content: Array<{ text: string }>;
+  structuredContent?: any;
+}
+
+export async function run(name: string, args: Record<string, unknown>): Promise<TestResult> {
+  const res = await requestContext.run({ accessToken: 'token' }, () => tool(name).handler(args));
+  return { ...res, content: res.content.map(c => ({ text: c.type === 'text' ? c.text : '' })) };
 }
 
 export const calendarBody = { id: 'joao@example.com', timeZone: 'America/Recife' };

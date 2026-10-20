@@ -1,21 +1,10 @@
 import { z } from "zod";
-import {
-  advanceToNextSlot,
-  alignToSlotBoundary,
-  getDayOfWeek,
-  isSlotBusy,
-  isWithinSearchHours,
-  toInstant,
-  toLocalISO,
-  type FormattedDateTime,
-} from "../lib/datetime.js";
+import { HMS_RE, advanceToNextSlot, alignToSlotBoundary, isSlotBusy, isWithinSearchHours } from "../lib/availability.js";
+import { getDayOfWeek, parseBound, toInstant, toLocalISO, type FormattedDateTime } from "../lib/datetime.js";
 import { formattedDateTimeSchema, type FreeBusyResponse } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
-import { parseBound } from "../lib/schedule.js";
 import { READ_SCOPE, defineTool } from "./define.js";
 import { calendarIdSchema, timeZoneSchema } from "./schemas.js";
-
-const HMS_RE = /^([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
 
 function formatSlotTime(date: Date, timeZone: string): FormattedDateTime {
   const local = toLocalISO(date, timeZone);
@@ -88,7 +77,7 @@ export const getNextAvailability = defineTool({
   async run(p, client) {
     const allCalendarIds = [...new Set([p.calendarId, ...(p.calendarIds ?? [])])];
     const startFrom = p.startFrom === undefined ? undefined : parseBound("startFrom", p.startFrom);
-    const timezone = p.timezone ?? await client.calendarTimeZone(p.calendarId);
+    const timezone = p.timezone ?? (await client.calendar(p.calendarId)).timeZone;
     const searchStart = startFrom ? new Date(toInstant(startFrom, timezone)) : new Date();
     const searchEnd = new Date(searchStart);
     searchEnd.setDate(searchEnd.getDate() + p.maxSearchDays);
