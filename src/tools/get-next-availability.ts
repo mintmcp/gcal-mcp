@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { HMS_RE, addMinutes, busyChecker, fitsWindow, hmsToSeconds, localClock, slotStarts, type Interval, type SearchWindow } from "../lib/availability.js";
+import { HMS_RE, addMinutes, busyChecker, fitsWindow, hmsToSeconds, isFullDay, localClock, slotStarts, type Interval, type SearchWindow } from "../lib/availability.js";
 import { formatDateTimeWithDay, parseBound, toInstant, toZonedIso, type FormattedDateTime } from "../lib/datetime.js";
 import { formattedDateTimeSchema, type FreeBusyResponse } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
@@ -10,9 +10,12 @@ function formatSlotTime(date: Date, timeZone: string): FormattedDateTime {
   return formatDateTimeWithDay({ dateTime: toZonedIso(date, timeZone) });
 }
 
-function searchWindow(days: readonly string[], start: string | undefined, end: string | undefined): SearchWindow {
+function searchWindow(days: readonly string[], start: string | undefined, end: string | undefined, duration: number): SearchWindow {
   const window = { days, startSeconds: start ? hmsToSeconds(start) : 0, endSeconds: end ? hmsToSeconds(end) : 24 * 3600 };
   if (window.startSeconds >= window.endSeconds) fail("searchHoursEnd must be after searchHoursStart; overnight windows are not supported.");
+  if (!isFullDay(window) && duration * 60 > window.endSeconds - window.startSeconds) {
+    fail("duration is longer than the daily search window set by searchHoursStart/searchHoursEnd.");
+  }
   return window;
 }
 
@@ -29,7 +32,7 @@ export const getNextAvailability = defineTool({
     "Pass `calendarIds` (email addresses of the people to meet, or calendar IDs) to find a slot that works for several people; `calendarId` (default primary) is always included. " +
     "Pass `startFrom` as ISO 8601 (date-only, naive datetime, or with offset). Defaults to NOW. " +
     "`duration` is the desired meeting length in minutes. " +
-    "Restrict to a daily window via `searchHoursStart`/`searchHoursEnd` (HH:MM[:SS] in `timezone`). " +
+    "Restrict to a daily window via `searchHoursStart`/`searchHoursEnd` (HH:MM[:SS] in `timezone`); with a daily window each slot must start and end on the same day inside it. " +
     "Restrict to specific weekdays via `includeDays` (default: Mon-Fri). " +
     "Slots align to `startTimeIncrement` (default 30 min) boundaries counted from local midnight in `timezone`; local times skipped by a daylight-saving change are not offered. " +
     "Each slot's start/end carries its UTC offset in its own `timezone` field. " +
@@ -79,7 +82,7 @@ export const getNextAvailability = defineTool({
     maxSearchDays: z.coerce.number().int().positive().max(365).optional().default(30).describe("Maximum days ahead of `startFrom` to scan. Default 30, hard cap 365."),
   },
   async run(p, client) {
-    const window = searchWindow(p.includeDays, p.searchHoursStart, p.searchHoursEnd);
+    const window = searchWindow(p.includeDays, p.searchHoursStart, p.searchHoursEnd, p.duration);
     const allCalendarIds = [...new Set([p.calendarId, ...(p.calendarIds ?? [])])];
     const startFrom = p.startFrom === undefined ? undefined : parseBound("startFrom", p.startFrom);
     const timezone = p.timezone ?? (await client.calendar(p.calendarId)).timeZone;

@@ -366,6 +366,26 @@ describe('get_next_availability', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('keeps a slot inside the daily window instead of spanning into the next day', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
+    const res = await run('get_next_availability', {
+      duration: 480, timezone: 'UTC', startFrom: '2026-10-19T09:00:00Z', searchHoursStart: '09:00', searchHoursEnd: '17:00', maxResults: 2,
+    });
+    expect(res.structuredContent.availableSlots.map((s: any) => [s.start.date, s.start.time, s.end.date, s.end.time])).toEqual([
+      ['2026-10-19', '09:00:00', '2026-10-19', '17:00:00'],
+      ['2026-10-20', '09:00:00', '2026-10-20', '17:00:00'],
+    ]);
+  });
+
+  it('rejects a duration longer than the daily search window before calling Google', async () => {
+    const res = await run('get_next_availability', {
+      duration: 1440, timezone: 'UTC', startFrom: '2026-10-19T09:00:00Z', searchHoursStart: '09:00', searchHoursEnd: '17:00',
+    });
+    expect(res.isError).toBe(true);
+    expect(errorOf(res).error).toMatch(/duration is longer than the daily search window/);
+    expect(calls).toHaveLength(0);
+  });
+
   it('caps maxResults and startTimeIncrement', async () => {
     expectInvalid(await run('get_next_availability', { duration: 30, timezone: 'UTC', maxResults: 101 }));
     expectInvalid(await run('get_next_availability', { duration: 30, timezone: 'UTC', startTimeIncrement: 1441 }));

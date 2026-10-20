@@ -8,8 +8,8 @@ const nineToFive = { days: weekdays, startSeconds: hmsToSeconds("09:00"), endSec
 const allDay = (days: string[]) => ({ days, startSeconds: 0, endSeconds: 24 * 3600 });
 
 describe("localClock", () => {
-  it("reads weekday, minute and seconds since midnight in the given zone", () => {
-    expect(localClock("Asia/Kathmandu")(new Date("2024-01-15T03:20:30Z"))).toEqual({ weekday: "Mon", seconds: 9 * 3600 + 5 * 60 + 30 });
+  it("reads the local date and seconds since midnight in the given zone", () => {
+    expect(localClock("Asia/Kathmandu")(new Date("2024-01-15T03:20:30Z"))).toEqual({ date: "2024-01-15", seconds: 9 * 3600 + 5 * 60 + 30 });
   });
 });
 
@@ -42,6 +42,20 @@ describe("fitsWindow", () => {
 
   it("rejects a slot whose end spills into an excluded day", () => {
     expect(fitsWindow(at("2024-01-12T23:30:00Z"), at("2024-01-13T00:30:00Z"), allDay(weekdays))).toBe(false);
+  });
+
+  it("rejects a slot that crosses into the next day of a bounded window", () => {
+    expect(fitsWindow(at("2026-10-19T09:00:00Z"), at("2026-10-20T09:00:00Z"), nineToFive)).toBe(false);
+  });
+
+  it("rejects an unrestricted multi-day slot that spans an excluded weekday", () => {
+    expect(fitsWindow(at("2024-01-12T12:00:00Z"), at("2024-01-15T12:00:00Z"), allDay(weekdays))).toBe(false);
+    expect(fitsWindow(at("2024-01-15T12:00:00Z"), at("2024-01-18T12:00:00Z"), allDay(weekdays))).toBe(true);
+  });
+
+  it("does not count the next day for a slot ending exactly at local midnight", () => {
+    expect(fitsWindow(at("2024-01-12T23:00:00Z"), at("2024-01-13T00:00:00Z"), allDay(weekdays))).toBe(true);
+    expect(fitsWindow(at("2024-01-11T12:00:00Z"), at("2024-01-13T00:00:00Z"), allDay(weekdays))).toBe(true);
   });
 });
 

@@ -1,9 +1,11 @@
 import { localInstant, toLocalISO } from "./datetime.js";
 
+const DAY_SECONDS = 24 * 3600;
+
 export const HMS_RE = /^([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/;
 
 export interface LocalClock {
-  weekday: string;
+  date: string;
   seconds: number;
 }
 
@@ -19,9 +21,11 @@ export function hmsToSeconds(hms: string): number {
 }
 
 export function localClock(timeZone: string): (date: Date) => LocalClock {
-  const formatter = new Intl.DateTimeFormat("en-US", {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone,
-    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -29,31 +33,58 @@ export function localClock(timeZone: string): (date: Date) => LocalClock {
   });
   return (date) => {
     const parts = Object.fromEntries(formatter.formatToParts(date).map((p) => [p.type, p.value]));
-    return { weekday: parts.weekday, seconds: Number(parts.hour) * 3600 + Number(parts.minute) * 60 + Number(parts.second) };
+    return {
+      date: `${parts.year}-${parts.month}-${parts.day}`,
+      seconds: Number(parts.hour) * 3600 + Number(parts.minute) * 60 + Number(parts.second),
+    };
   };
 }
 
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function weekdayOf(date: string): string {
+  return WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()];
+}
+
+export function isFullDay(window: SearchWindow): boolean {
+  return window.startSeconds === 0 && window.endSeconds === DAY_SECONDS;
+}
+
 export function fitsWindow(start: LocalClock, end: LocalClock, window: SearchWindow): boolean {
-  return window.days.includes(start.weekday)
-    && window.days.includes(end.weekday)
+  const endsAtMidnight = end.seconds === 0 && end.date > start.date;
+  const lastDate = endsAtMidnight ? previousDay(end.date) : end.date;
+  const endSeconds = endsAtMidnight ? DAY_SECONDS : end.seconds;
+  if (lastDate !== start.date) {
+    if (!isFullDay(window)) return false;
+    for (let date = start.date; date <= lastDate; date = nextDay(date)) {
+      if (!window.days.includes(weekdayOf(date))) return false;
+    }
+    return true;
+  }
+  return window.days.includes(weekdayOf(start.date))
     && start.seconds >= window.startSeconds
-    && start.seconds < window.endSeconds
-    && end.seconds >= window.startSeconds
-    && end.seconds <= window.endSeconds;
+    && endSeconds <= window.endSeconds;
 }
 
 export function addMinutes(date: Date, minutes: number): Date {
   return new Date(date.getTime() + minutes * 60_000);
 }
 
-const DAY_SECONDS = 24 * 3600;
 
 function hms(seconds: number): string {
   return [seconds / 3600, (seconds % 3600) / 60, seconds % 60].map((n) => String(Math.floor(n)).padStart(2, "0")).join(":");
 }
 
+function shiftDay(date: string, days: number): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY_SECONDS * 1000).toISOString().slice(0, 10);
+}
+
 function nextDay(date: string): string {
-  return new Date(Date.parse(`${date}T00:00:00Z`) + DAY_SECONDS * 1000).toISOString().slice(0, 10);
+  return shiftDay(date, 1);
+}
+
+function previousDay(date: string): string {
+  return shiftDay(date, -1);
 }
 
 export function* slotStarts(from: Date, incrementMinutes: number, timeZone: string): Generator<Date, never> {
