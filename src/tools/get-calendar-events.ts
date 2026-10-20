@@ -15,6 +15,9 @@ async function resolveBounds(
   const zone = client.zone(calendarId, timeZone);
   const min = timeMin === undefined ? new Date().toISOString() : await resolveInstant(parseBound("timeMin", timeMin), zone);
   const max = timeMax === undefined ? undefined : await resolveInstant(parseBound("timeMax", timeMax), zone);
+  if (max && Date.parse(max) <= Date.parse(min)) {
+    fail(`\`timeMax\` must be after \`timeMin\`${timeMin === undefined ? " (which defaults to NOW; pass an earlier `timeMin` for past events)" : ""}.`, { timeMin: min, timeMax: max });
+  }
   return { timeMin: min, ...(max && { timeMax: max }) };
 }
 

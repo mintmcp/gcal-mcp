@@ -54,6 +54,14 @@ describe('get_calendar_events', () => {
     expect(res.structuredContent.message).toContain('pageToken');
   });
 
+  it('rejects a timeMax that is not after timeMin without calling Google', async () => {
+    const reversed = await run('get_calendar_events', { timeMin: '2026-10-22T10:00:00Z', timeMax: '2026-10-21T10:00:00Z' });
+    expect(errorOf(reversed).error).toMatch(/`timeMax` must be after `timeMin`\.$/);
+    const past = await run('get_calendar_events', { timeMax: '2020-01-01T00:00:00Z' });
+    expect(errorOf(past).error).toMatch(/defaults to NOW/);
+    expect(calls).toHaveLength(0);
+  });
+
   it('interprets naive bounds in the calendar time zone when no timeZone is given', async () => {
     stub(CALENDAR, calendarBody);
     stub(LIST_EVENTS, { items: [] });
