@@ -3,7 +3,7 @@ import { eventPath, type CalendarClient } from "../google/client.js";
 import { describeAttendeeRoster } from "../lib/attendees.js";
 import { eventSchema, toStructuredEvent, type CalendarEvent, type EventAttendee } from "../lib/event-model.js";
 import { ToolFailure, fail } from "../lib/failure.js";
-import { WRITE_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, sendUpdatesSchema } from "./schemas.js";
 
 export type CallerAttendeeMatch =
@@ -55,7 +55,6 @@ export const respondToEvent = defineTool({
     "For a recurring event, passing the series eventId responds for the ENTIRE series, while passing a single instance ID ('<eventId>_<UTC timestamp>', e.g. 'abc123_20240115T170000Z') responds for that one occurrence only. " +
     "Optionally attach a `comment` for the organizer. `sendUpdates` controls whether your response notifies others. " +
     "Returns the event with your updated response {id, summary, myResponseStatus, myComment, attendees, ...}, where myComment is your currently stored response comment (omitted when you have none).",
-  scope: WRITE_SCOPE,
   outputSchema: {
     ...eventSchema.shape,
     myResponseStatus: z.string(),

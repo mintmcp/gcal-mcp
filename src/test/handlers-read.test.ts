@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { NOT_CONNECTED_MESSAGE } from '../auth.js';
 import {
   CALENDAR,
   FREE_BUSY,
@@ -8,14 +9,25 @@ import {
   calls,
   callsTo,
   errorOf,
+  expectInvalid,
   eventBody,
   only,
   run,
   stub,
+  tool,
   useGoogleStub,
 } from './harness.js';
 
 useGoogleStub();
+
+describe('tool handlers', () => {
+  it('answer without an access token with the not-connected result and no Google call', async () => {
+    const res = await tool('list_calendars').handler({});
+    expect(res.isError).toBe(true);
+    expect(errorOf(res as { content: Array<{ text: string }> })).toEqual({ error: NOT_CONNECTED_MESSAGE, status: 401 });
+    expect(calls).toHaveLength(0);
+  });
+});
 
 describe('get_calendar_events', () => {
   it('forwards a free-text query and keeps the default lower bound so upcoming matches come first', async () => {
@@ -32,7 +44,7 @@ describe('get_calendar_events', () => {
     stub(LIST_EVENTS, { items: [] });
     await run('get_calendar_events', { q: '  budget review  ' });
     expect(only(LIST_EVENTS).url.searchParams.get('q')).toBe('budget review');
-    await expect(run('get_calendar_events', { q: '   ' })).rejects.toThrow();
+    expectInvalid(await run('get_calendar_events', { q: '   ' }));
   });
 
   it('keeps the page token when Google returns an empty page with more results behind it', async () => {
@@ -68,17 +80,17 @@ describe('get_calendar_events', () => {
   });
 
   it('rejects an unknown time zone name instead of falling back to the calendar zone', async () => {
-    await expect(run('get_calendar_events', { timeZone: 'Not/AZone' })).rejects.toThrow(/time zone/);
-    await expect(run('get_event', { eventId: 'ev1', timeZone: 'Not/AZone' })).rejects.toThrow(/time zone/);
-    await expect(run('get_next_availability', { duration: 30, timezone: 'Not/AZone' })).rejects.toThrow(/time zone/);
+    expectInvalid(await run('get_calendar_events', { timeZone: 'Not/AZone' }), /time zone/);
+    expectInvalid(await run('get_event', { eventId: 'ev1', timeZone: 'Not/AZone' }), /time zone/);
+    expectInvalid(await run('get_next_availability', { duration: 30, timezone: 'Not/AZone' }), /time zone/);
     expect(calls).toHaveLength(0);
   });
 
   it('rejects page sizes outside the documented ranges', async () => {
-    await expect(run('get_calendar_events', { maxResults: -5 })).rejects.toThrow();
-    await expect(run('get_calendar_events', { maxResults: 2501 })).rejects.toThrow();
-    await expect(run('list_calendars', { maxResults: 0 })).rejects.toThrow();
-    await expect(run('list_calendars', { maxResults: 251 })).rejects.toThrow();
+    expectInvalid(await run('get_calendar_events', { maxResults: -5 }));
+    expectInvalid(await run('get_calendar_events', { maxResults: 2501 }));
+    expectInvalid(await run('list_calendars', { maxResults: 0 }));
+    expectInvalid(await run('list_calendars', { maxResults: 251 }));
   });
 
   it('exposes organizer, rich attendees and event flags in the output', async () => {
@@ -280,6 +292,18 @@ describe('get_next_availability', () => {
     expect(res.structuredContent.availableSlots[0].start.time).toBe('11:00:00');
   });
 
+  it('offers slots on local hour and half-hour boundaries in zones with uneven offsets', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
+    const kolkata = await run('get_next_availability', {
+      duration: 60, timezone: 'Asia/Kolkata', startFrom: '2026-10-20T09:10:00', startTimeIncrement: 60, maxResults: 3,
+    });
+    expect(kolkata.structuredContent.availableSlots.map((s: any) => s.start.time)).toEqual(['10:00:00', '11:00:00', '12:00:00']);
+    const kathmandu = await run('get_next_availability', {
+      duration: 30, timezone: 'Asia/Kathmandu', startFrom: '2026-10-20T09:10:00', maxResults: 3,
+    });
+    expect(kathmandu.structuredContent.availableSlots.map((s: any) => s.start.time)).toEqual(['09:30:00', '10:00:00', '10:30:00']);
+  });
+
   it('falls back to the calendar time zone when none is given', async () => {
     stub(CALENDAR, calendarBody);
     stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
@@ -311,11 +335,11 @@ describe('get_next_availability', () => {
   });
 
   it('rejects more calendars than one free/busy query can hold', async () => {
-    await expect(run('get_next_availability', {
+    expectInvalid(await run('get_next_availability', {
       duration: 30,
       timezone: 'UTC',
       calendarIds: Array.from({ length: 50 }, (_, i) => `p${i}@example.com`),
-    })).rejects.toThrow();
+    }));
   });
 
   it('names the calendar that failed in a multi-calendar lookup', async () => {

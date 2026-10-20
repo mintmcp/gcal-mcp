@@ -2,12 +2,13 @@ import { z } from "zod";
 import { eventsPath } from "../google/client.js";
 import { attachmentInputSchema, attachmentsDescription, normalizeAttachments } from "../lib/attachments.js";
 import { attendeeInputSchema, normalizeAttendees } from "../lib/attendees.js";
-import { buildEventOptions, eventOptionsInputSchema, eventTypeInputSchema, validateEventTypeTimes, withEventTypeHint } from "../lib/event-options.js";
-import { eventSchema, toStructuredEvent } from "../lib/event-model.js";
+import { buildEventOptions, eventOptionsInputSchema, eventTypeInputSchema, validateEventTypeTimes } from "../lib/event-options.js";
+import { eventSchema } from "../lib/event-model.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { assertOrdered, inZone, lacksNamedZone, parseRange, rangeTimes } from "../lib/schedule.js";
-import { WRITE_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, inputTimeZoneSchema, sendUpdatesSchema } from "./schemas.js";
+import { writeEvent } from "./write-event.js";
 
 export const createEvent = defineTool({
   name: "create_event",
@@ -20,7 +21,6 @@ export const createEvent = defineTool({
     "Optional extras: `recurrence` (RRULE strings) for a repeating series, `addGoogleMeet` for a Meet link, `colorId`, `visibility`, `availability` (busy/free), `reminders`, `guestPermissions` and Drive `attachments`. " +
     "Special kinds via `eventType`: outOfOffice (with `outOfOffice` decline settings), focusTime (`focusTime`), workingLocation (`workingLocation`); these are only accepted on the primary calendar. " +
     "Returns the created event including `id` which is required for update_event / delete_event.",
-  scope: WRITE_SCOPE,
   outputSchema: eventSchema.shape,
   schema: {
     calendarId: calendarIdSchema('Calendar ID. Defaults to "primary". Use list_calendars to discover other calendar IDs.'),
@@ -61,19 +61,13 @@ export const createEvent = defineTool({
       ...times,
       ...(attendees && { attendees }),
     };
-    try {
-      const created = await client.event(eventsPath(p.calendarId), {
-        method: "POST",
-        query: {
-          sendUpdates: p.sendUpdates,
-          conferenceDataVersion: body.conferenceData ? "1" : undefined,
-          supportsAttachments: attachments ? "true" : undefined,
-        },
-        body,
-      }, { operation: "create calendar event", resource: "calendar", resourceId: p.calendarId });
-      return toStructuredEvent(created);
-    } catch (err) {
-      throw withEventTypeHint(err, options.eventType);
-    }
+    return writeEvent(client, {
+      method: "POST",
+      path: eventsPath(p.calendarId),
+      body,
+      sendUpdates: p.sendUpdates,
+      eventType: options.eventType,
+      ctx: { operation: "create calendar event", resource: "calendar", resourceId: p.calendarId },
+    });
   },
 });

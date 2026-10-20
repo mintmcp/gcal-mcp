@@ -86,7 +86,7 @@ export interface GoogleErrorContext {
   resourceId?: string;
 }
 
-export function mapGoogleError(result: GoogleFetchFailure, ctx: GoogleErrorContext): FailurePayload {
+export function mapGoogleError(result: GoogleFetchFailure, ctx: GoogleErrorContext, carriesTimes: boolean): FailurePayload {
   const body = result.bodyJson as { error?: { message?: unknown; errors?: Array<{ reason?: unknown }> } } | undefined;
   const googleMessage = typeof body?.error?.message === "string" ? body.error.message : undefined;
   const reason = body?.error?.errors?.[0]?.reason;
@@ -120,7 +120,7 @@ export function mapGoogleError(result: GoogleFetchFailure, ctx: GoogleErrorConte
   switch (result.status) {
     case 400:
       return permanent(`Invalid request to ${ctx.operation}: ${googleMessage || result.bodyText || "Google rejected the request as malformed."}${
-        googleReason && MALFORMED_EVENT_TYPE_RE.test(googleReason) ? "" : " Check parameter formats (ISO 8601 datetimes, valid timezone identifiers, time ranges)."
+        carriesTimes && !(googleReason && MALFORMED_EVENT_TYPE_RE.test(googleReason)) ? " Check parameter formats (ISO 8601 datetimes, valid timezone identifiers, time ranges)." : ""
       }`);
     case 401:
       return permanent(`Authentication failed while trying to ${ctx.operation}. The user's Google session is invalid or expired and they need to re-authenticate. Do NOT retry; surface this to the user.`);
@@ -167,6 +167,13 @@ export interface RequestOptions {
   ifMatch?: string;
 }
 
+const TIME_FIELDS = ["start", "end", "timeMin", "timeMax", "timeZone"];
+
+function carriesTimes({ query = {}, body }: RequestOptions): boolean {
+  const fields: Record<string, unknown> = { ...query, ...(typeof body === "object" && body) };
+  return TIME_FIELDS.some((field) => fields[field] !== undefined);
+}
+
 export interface CalendarInfo {
   id?: string;
   timeZone: string;
@@ -198,7 +205,7 @@ export class CalendarClient {
 
   async call<T>(path: string, options: RequestOptions, ctx: GoogleErrorContext): Promise<T | undefined> {
     const res = await this.send(path, options);
-    if (!res.ok) throw new ToolFailure(mapGoogleError(res, ctx));
+    if (!res.ok) throw new ToolFailure(mapGoogleError(res, ctx, carriesTimes(options)));
     return res.bodyJson as T | undefined;
   }
 

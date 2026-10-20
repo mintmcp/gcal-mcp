@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { calendarSchema, type CalendarListResponse } from "../lib/event-model.js";
-import { READ_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 
 export const listCalendars = defineTool({
   name: "list_calendars",
@@ -8,7 +8,6 @@ export const listCalendars = defineTool({
     "List all Google Calendars the authenticated user has access to (primary, shared, subscribed, secondary). " +
     "Use this when the user names a calendar (e.g. \"my work calendar\", \"team calendar\") and you need its ID; for the user's MAIN calendar you do NOT need to call this first: pass calendarId='primary' to the other tools. " +
     "Returns up to `maxResults` items; if `nextPageToken` is returned, paginate by passing it back as `pageToken`.",
-  scope: READ_SCOPE,
   readOnlyHint: true,
   outputSchema: {
     calendars: z.array(calendarSchema),

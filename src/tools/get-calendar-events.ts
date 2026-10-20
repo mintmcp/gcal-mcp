@@ -5,7 +5,7 @@ import { eventSchema, toStructuredEvent, type EventsListResponse } from "../lib/
 import { fail } from "../lib/failure.js";
 import { decodePageToken, encodePageToken, queryFingerprint } from "../lib/page-token.js";
 import { EVENT_TYPES } from "../lib/event-options.js";
-import { READ_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, timeZoneSchema } from "./schemas.js";
 
 async function resolveBounds(
@@ -32,7 +32,6 @@ export const getCalendarEvents = defineTool({
     "Recurring events are returned as expanded instances; each `id` (which may contain a date suffix) targets that single occurrence in update_event/delete_event. Set `expandRecurring=false` to get series masters instead. " +
     "Filter by `eventTypes` (default, outOfOffice, focusTime, workingLocation, birthday, fromGmail); without it Google returns every type. `orderBy` is startTime (default) or updated; `showDeleted` includes cancelled events. " +
     "Event `id`s in the response are required for update_event / delete_event.",
-  scope: READ_SCOPE,
   readOnlyHint: true,
   outputSchema: {
     calendarId: z.string(),
@@ -60,7 +59,7 @@ export const getCalendarEvents = defineTool({
       .describe("Free-text search. Case-insensitive; matches title, description, location and attendee names/emails. Searches from `timeMin` (default NOW); pass an earlier `timeMin` to include past events."),
     pageToken: z.string().optional().describe("Pagination token from a prior call's `nextPageToken`. Pass it back to fetch the next page."),
     eventTypes: z
-      .array(z.enum(["default", "outOfOffice", "focusTime", "workingLocation", "birthday", "fromGmail"]))
+      .array(z.enum(EVENT_TYPES))
       .min(1)
       .optional()
       .describe('Only return these event types, e.g. ["outOfOffice"] or ["workingLocation"]. Omit for every type.'),

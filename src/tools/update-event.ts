@@ -2,13 +2,14 @@ import { z } from "zod";
 import { eventPath, type CalendarClient } from "../google/client.js";
 import { attachmentInputSchema, mergeAttachments, normalizeAttachments } from "../lib/attachments.js";
 import { attendeeInputSchema, emailSchema, mergeAttendees, normalizeAttendees } from "../lib/attendees.js";
-import { assertEventTypeOptions, buildEventOptions, eventOptionsInputSchema, validateEventTypeTimes, withEventTypeHint } from "../lib/event-options.js";
-import { eventSchema, toStructuredEvent, type CalendarEvent, type EventAttachment } from "../lib/event-model.js";
+import { assertEventTypeOptions, buildEventOptions, eventOptionsInputSchema, validateEventTypeTimes } from "../lib/event-options.js";
+import { eventSchema, type CalendarEvent, type EventAttachment } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import {
   assertOrdered,
   endOnlyTimes,
+  inZone,
   lacksNamedZone,
   parseReschedule,
   rangeTimes,
@@ -20,8 +21,9 @@ import {
   type TimePair,
   type Zone,
 } from "../lib/schedule.js";
-import { WRITE_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, inputTimeZoneSchema, sendUpdatesSchema } from "./schemas.js";
+import { writeEvent } from "./write-event.js";
 
 const schema = {
   calendarId: calendarIdSchema('Calendar containing the event. Defaults to "primary".'),
@@ -78,29 +80,45 @@ function changedTimes(reschedule: Reschedule, current: CalendarEvent, inputZone:
   }
 }
 
-async function zoneLabels(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, recurring: boolean, client: CalendarClient): Promise<ZoneLabels> {
-  if (recurring) {
-    const zone = p.timeZone ?? current.start?.timeZone ?? await client.zone(p.calendarId)();
+function isRecurring(p: UpdateArgs, current: CalendarEvent): boolean {
+  return (p.recurrence ?? current.recurrence ?? []).length > 0;
+}
+
+function seriesZone(p: UpdateArgs, current: CalendarEvent, client: CalendarClient): Promise<string> {
+  return client.zone(p.calendarId, p.timeZone ?? current.start?.timeZone)();
+}
+
+async function zoneLabels(p: UpdateArgs, reschedule: Reschedule, current: CalendarEvent, client: CalendarClient): Promise<ZoneLabels> {
+  if (isRecurring(p, current)) {
+    const zone = await seriesZone(p, current, client);
     return { start: zone, end: zone };
   }
   return {
-    start: reschedule?.kind === "end" ? current.start?.timeZone : p.timeZone ?? current.start?.timeZone,
+    start: reschedule.kind === "end" ? current.start?.timeZone : p.timeZone ?? current.start?.timeZone,
     end: p.timeZone ?? current.end?.timeZone,
   };
 }
 
-async function schedulePatch(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, client: CalendarClient) {
-  const stored = storedTimes(current);
-  const recurring = p.recurrence !== undefined ? p.recurrence.length > 0 : (current.recurrence?.length ?? 0) > 0;
-  if (!reschedule && !(recurring && stored && lacksNamedZone(stored))) return {};
-  const timed = reschedule?.kind === "range" ? reschedule.range.kind === "datetime" : current.start?.dateTime !== undefined;
-  const labels = timed ? await zoneLabels(p, reschedule, current, recurring, client) : {};
+async function rescheduledTimes(p: UpdateArgs, reschedule: Reschedule, current: CalendarEvent, client: CalendarClient): Promise<TimePair> {
+  const timed = reschedule.kind === "range" ? reschedule.range.kind === "datetime" : current.start?.dateTime !== undefined;
+  const labels = timed ? await zoneLabels(p, reschedule, current, client) : {};
   const inputZone = client.zone(p.calendarId, p.timeZone);
-  const times = reschedule ? await changedTimes(reschedule, current, inputZone, async () => labels.end ?? await inputZone()) : stored;
+  const times = await changedTimes(reschedule, current, inputZone, client.zone(p.calendarId, labels.end));
+  return { start: relabel(times.start, labels.start), end: relabel(times.end, labels.end) };
+}
+
+async function rezonedSeriesTimes(p: UpdateArgs, current: CalendarEvent, client: CalendarClient): Promise<TimePair | undefined> {
+  const stored = storedTimes(current);
+  if (!stored || !isRecurring(p, current) || !lacksNamedZone(stored)) return undefined;
+  return inZone(stored, await seriesZone(p, current, client));
+}
+
+async function schedulePatch(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, client: CalendarClient) {
+  const times = reschedule ? await rescheduledTimes(p, reschedule, current, client) : await rezonedSeriesTimes(p, current, client);
   if (!times) return {};
   validateEventTypeTimes(current.eventType, times);
   assertOrdered(times);
-  return { start: toPatchTime(relabel(times.start, labels.start)), end: toPatchTime(relabel(times.end, labels.end)) };
+  return { start: toPatchTime(times.start), end: toPatchTime(times.end) };
 }
 
 async function loadCurrent(client: CalendarClient, calendarId: string, eventId: string): Promise<CalendarEvent> {
@@ -112,6 +130,15 @@ async function loadCurrent(client: CalendarClient, calendarId: string, eventId: 
     });
   }
   return current;
+}
+
+function assertSeriesWideVisibility(p: UpdateArgs, current: CalendarEvent): void {
+  if (p.visibility === undefined || !current.recurringEventId) return;
+  fail(`Google applies a visibility change on one occurrence to the whole series, so it is not changed per occurrence. To change visibility for the whole series, pass the series id "${current.recurringEventId}" as eventId.`, {
+    resource: "event",
+    resourceId: p.eventId,
+    recurringEventId: current.recurringEventId,
+  });
 }
 
 function attendeePatch(p: UpdateArgs, current: CalendarEvent) {
@@ -142,8 +169,7 @@ export const updateEvent = defineTool({
     "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead: it preserves everyone else's responses. " +
     "Optional extras: `recurrence`, `addGoogleMeet`, `colorId`, `visibility`, `availability` (busy/free), `reminders` and `guestPermissions`. " +
     "Drive attachments: `addAttachments` / `removeAttachments` edit the list incrementally; `attachments` REPLACES it (pass [] to remove all). " +
-    "Cannot move an event between calendars or change its `eventType`. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only. Returns the updated event including a fresh `updated` timestamp.",
-  scope: WRITE_SCOPE,
+    "Cannot move an event between calendars or change its `eventType`. For a recurring-instance `eventId` (date-suffixed), the patch applies to that single occurrence only, except `visibility`: Google applies it to the whole series, so it is rejected on an occurrence; pass the series id (the occurrence's `recurringEventId`) to change visibility for the whole series. Returns the updated event including a fresh `updated` timestamp.",
   destructiveHint: true,
   outputSchema: eventSchema.shape,
   schema,
@@ -155,11 +181,9 @@ export const updateEvent = defineTool({
     const replacedAttachments = p.attachments && normalizeAttachments(p.attachments);
     const addedAttachments = normalizeAttachments(p.addAttachments ?? []);
 
-    const needsCurrent = reschedule !== undefined
-      || (p.recurrence?.length ?? 0) > 0
-      || [p.addAttendees, p.removeAttendees, p.addAttachments, p.removeAttachments, p.availability, p.visibility].some((v) => v !== undefined);
-    const current = needsCurrent ? await loadCurrent(client, p.calendarId, p.eventId) : undefined;
-    if (current) assertEventTypeOptions(current.eventType, p);
+    const current = await loadCurrent(client, p.calendarId, p.eventId);
+    assertEventTypeOptions(current.eventType, p);
+    assertSeriesWideVisibility(p, current);
 
     const patch = {
       ...options,
@@ -168,27 +192,18 @@ export const updateEvent = defineTool({
       ...(p.location !== undefined && { location: p.location }),
       ...(p.attendees !== undefined && { attendees: normalizeAttendees(p.attendees) }),
       ...(replacedAttachments && { attachments: replacedAttachments }),
-      ...(current && {
-        ...await schedulePatch(p, reschedule, current, client),
-        ...attendeePatch(p, current),
-        ...attachmentPatch(p, addedAttachments, current),
-      }),
+      ...await schedulePatch(p, reschedule, current, client),
+      ...attendeePatch(p, current),
+      ...attachmentPatch(p, addedAttachments, current),
     };
-
-    try {
-      const updated = await client.event(eventPath(p.calendarId, p.eventId), {
-        method: "PATCH",
-        query: {
-          sendUpdates: p.sendUpdates,
-          conferenceDataVersion: patch.conferenceData ? "1" : undefined,
-          supportsAttachments: patch.attachments ? "true" : undefined,
-        },
-        body: patch,
-        ifMatch: current?.etag,
-      }, { operation: "update calendar event", resource: "event", resourceId: p.eventId });
-      return toStructuredEvent(updated);
-    } catch (err) {
-      throw withEventTypeHint(err, current?.eventType);
-    }
+    return writeEvent(client, {
+      method: "PATCH",
+      path: eventPath(p.calendarId, p.eventId),
+      body: patch,
+      sendUpdates: p.sendUpdates,
+      ifMatch: current.etag,
+      eventType: current.eventType,
+      ctx: { operation: "update calendar event", resource: "event", resourceId: p.eventId },
+    });
   },
 });

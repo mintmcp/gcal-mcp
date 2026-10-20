@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandler } from "express";
 import { jsonRpcError, messagesOf, responseIdFor } from "./jsonrpc.js";
 
@@ -44,19 +43,3 @@ export const requireAccessToken: RequestHandler = (req, res, next) => {
   }
   requestContext.run({ accessToken }, next);
 };
-
-export function withGoogleAuth<TArgs>(
-  _scope: string,
-  handler: (args: TArgs, context: { accessToken: string }) => Promise<CallToolResult>,
-) {
-  return async (args: TArgs): Promise<CallToolResult> => {
-    const accessToken = getAccessToken();
-    if (!accessToken) {
-      return {
-        content: [{ type: "text", text: JSON.stringify({ error: NOT_CONNECTED_MESSAGE, status: 401 }) }],
-        isError: true,
-      };
-    }
-    return handler(args, { accessToken });
-  };
-}

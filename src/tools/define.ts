@@ -1,16 +1,12 @@
 import { z } from "zod";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { withGoogleAuth } from "../auth.js";
+import { NOT_CONNECTED_MESSAGE, getAccessToken } from "../auth.js";
 import { CalendarClient } from "../google/client.js";
-import { ToolFailure, type FailurePayload } from "../lib/failure.js";
-
-export const READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly";
-export const WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+import { ToolFailure, fail, type FailurePayload } from "../lib/failure.js";
 
 interface ToolDefinition<S extends z.ZodRawShape, O extends z.ZodRawShape> {
   name: string;
   description: string;
-  scope: typeof READ_SCOPE | typeof WRITE_SCOPE;
   schema: S;
   outputSchema: O;
   readOnlyHint?: boolean;
@@ -37,18 +33,9 @@ function errorResult(payload: FailurePayload): CallToolResult {
 }
 
 export function defineTool<S extends z.ZodRawShape, O extends z.ZodRawShape>({
-  run, scope, schema, outputSchema, name, description, readOnlyHint = false, destructiveHint = false,
+  run, schema, outputSchema, name, description, readOnlyHint = false, destructiveHint = false,
 }: ToolDefinition<S, O>): RegisteredTool {
   const input = z.object(schema);
-  const authed = withGoogleAuth(scope, async (args: z.infer<z.ZodObject<S>>, { accessToken }) => {
-    try {
-      const structured = await run(args, new CalendarClient(accessToken));
-      return { content: textResult(structured), structuredContent: structured };
-    } catch (err) {
-      if (err instanceof ToolFailure) return errorResult(err.payload);
-      return errorResult({ error: `Unexpected error in ${name}: ${err instanceof Error ? err.message : String(err)}` });
-    }
-  });
   return {
     name,
     description,
@@ -56,6 +43,16 @@ export function defineTool<S extends z.ZodRawShape, O extends z.ZodRawShape>({
     outputSchema,
     readOnlyHint,
     destructiveHint,
-    handler: (args) => authed(input.parse(args)),
+    async handler(args) {
+      try {
+        const accessToken = getAccessToken() || fail(NOT_CONNECTED_MESSAGE, { status: 401 });
+        const structured = await run(input.parse(args), new CalendarClient(accessToken));
+        return { content: textResult(structured), structuredContent: structured };
+      } catch (err) {
+        if (err instanceof ToolFailure) return errorResult(err.payload);
+        if (err instanceof z.ZodError) return errorResult({ error: `Invalid arguments for ${name}: ${z.prettifyError(err)}` });
+        return errorResult({ error: `Unexpected error in ${name}: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    },
   };
 }

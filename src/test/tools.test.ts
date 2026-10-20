@@ -29,13 +29,18 @@ describe('describeAttendeeRoster', () => {
 });
 
 describe('mapGoogleError', () => {
-  const badRequest = (reason: string) => mapGoogleError(
+  const badRequest = (reason: string, carriesTimes = true) => mapGoogleError(
     { ok: false, kind: 'http', status: 400, statusText: 'Bad Request', bodyText: '', bodyJson: { error: { message: 'Bad thing.', errors: [{ reason }] } } },
     { operation: 'create calendar event' },
+    carriesTimes,
   );
 
-  it('keeps the format advice for a generic bad request', () => {
+  it('keeps the format advice for a generic bad request that carried times', () => {
     expect(badRequest('badRequest').error).toMatch(/Bad thing\. Check parameter formats/);
+  });
+
+  it('drops the format advice when the request carried no times', () => {
+    expect(badRequest('badRequest', false).error).toBe('Invalid request to create calendar event: Bad thing.');
   });
 
   it('drops the format advice when Google names a malformed special event', () => {

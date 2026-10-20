@@ -1,3 +1,4 @@
+import { domainToASCII } from "node:url";
 import { z } from "zod";
 import { fail } from "./failure.js";
 import type { EventAttendee } from "./event-model.js";
@@ -44,7 +45,13 @@ export function describeAttendeeRoster(attendees: EventAttendee[], sampleSize = 
   return `${attendees.length} attendee(s)${sample ? `, e.g. ${sample}${rest > 0 ? ` and ${rest} more` : ""}` : ""}`;
 }
 
-const emailKey = (email: string | undefined) => email?.trim().toLowerCase();
+function emailKey(email: string | undefined): string | undefined {
+  const address = email?.trim().toLowerCase();
+  const at = address?.lastIndexOf("@") ?? -1;
+  if (!address || at < 0) return address;
+  const domain = address.slice(at + 1);
+  return `${address.slice(0, at)}@${domainToASCII(domain) || domain}`;
+}
 
 export function mergeAttendees(existing: EventAttendee[] = [], add: EventAttendee[], remove: string[]): EventAttendee[] {
   const removed = new Set(remove.map(emailKey));

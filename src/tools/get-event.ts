@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { eventSchema, toStructuredEvent } from "../lib/event-model.js";
-import { READ_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, timeZoneSchema } from "./schemas.js";
 
 export const getEvent = defineTool({
@@ -12,7 +12,6 @@ export const getEvent = defineTool({
     "For a recurring event, pass the series `eventId` to read the series master, or a single instance ID ('<eventId>_<UTC timestamp>', e.g. 'abc123_20240115T170000Z') to read that one occurrence. " +
     "Returns the event {id, summary, start, end, location, description, attendees, ...}. Its `id` is the same value required by update_event / delete_event. " +
     "Recurring events are distinguishable: a SERIES MASTER carries `recurrence` (RRULE strings describing the repeat pattern); a single INSTANCE carries `recurringEventId` (the series `id`, to navigate back to the master) and `originalStartTime` (its scheduled slot; if it differs from `start`, the occurrence was moved).",
-  scope: READ_SCOPE,
   readOnlyHint: true,
   outputSchema: {
     calendarId: z.string(),

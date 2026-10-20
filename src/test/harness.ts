@@ -90,3 +90,10 @@ export function errorOf(res: { content: Array<{ text: string }> }) {
   return JSON.parse(res.content[0].text);
 }
 
+
+export function expectInvalid(res: TestResult, pattern?: RegExp) {
+  expect(res.isError).toBe(true);
+  const { error } = errorOf(res);
+  expect(error).toMatch(/^Invalid arguments for /);
+  if (pattern) expect(error).toMatch(pattern);
+}

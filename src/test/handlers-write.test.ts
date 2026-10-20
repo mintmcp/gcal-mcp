@@ -8,6 +8,7 @@ import {
   calls,
   callsTo,
   errorOf,
+  expectInvalid,
   eventBody,
   only,
   run,
@@ -106,7 +107,7 @@ describe('create_event', () => {
   });
 
   it('rejects an unknown time zone name', async () => {
-    await expect(run('create_event', { summary: 'S', start: '2026-10-20T10:00:00', end: '2026-10-20T11:00:00', timeZone: 'Not/AZone' })).rejects.toThrow(/time zone/);
+    expectInvalid(await run('create_event', { summary: 'S', start: '2026-10-20T10:00:00', end: '2026-10-20T11:00:00', timeZone: 'Not/AZone' }), /time zone/);
   });
 });
 
@@ -252,11 +253,12 @@ describe('update_event', () => {
     expect(calls).toHaveLength(1);
   });
 
-  it('patches event options and a Meet link request without reading the event first', async () => {
+  it('patches event options and a Meet link request', async () => {
+    stub(GET_EVENT, eventBody);
     stub(PATCH_EVENT, eventBody);
     await run('update_event', { eventId: 'ev1', colorId: '2', addGoogleMeet: true });
     const { url, body } = only(PATCH_EVENT);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     expect(url.searchParams.get('conferenceDataVersion')).toBe('1');
     expect(body).toMatchObject({ colorId: '2' });
     expect(body.conferenceData.createRequest.conferenceSolutionKey).toEqual({ type: 'hangoutsMeet' });
@@ -384,10 +386,11 @@ describe('update_event attachments', () => {
   });
 
   it('replaces the whole attachment list when `attachments` is given', async () => {
+    stub(GET_EVENT, eventBody);
     stub(PATCH_EVENT, eventBody);
     await run('update_event', { eventId: 'ev1', attachments: [] });
     const patch = only(PATCH_EVENT);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     expect(patch.body.attachments).toEqual([]);
     expect(patch.url.searchParams.get('supportsAttachments')).toBe('true');
   });

@@ -86,6 +86,15 @@ describe('mergeAttendees', () => {
   it('tolerates a missing attendee list', () => {
     expect(mergeAttendees(undefined, [{ email: 'x@example.com' }], [])).toEqual([{ email: 'x@example.com' }]);
   });
+
+  it('matches a punycode domain against the Unicode spelling Google stores, and the reverse', () => {
+    const unicode = { email: 'user@рф.рф', responseStatus: 'accepted' };
+    const punycode = { email: 'user@xn--p1ai.xn--p1ai', responseStatus: 'accepted' };
+    expect(mergeAttendees([unicode], [], ['user@xn--p1ai.xn--p1ai'])).toEqual([]);
+    expect(mergeAttendees([punycode], [], ['USER@РФ.РФ'])).toEqual([]);
+    expect(mergeAttendees([unicode], [{ email: 'user@XN--P1AI.xn--p1ai' }], [])).toEqual([unicode]);
+    expect(mergeAttendees([punycode], [{ email: 'user@рф.рф' }], [])).toEqual([punycode]);
+  });
 });
 
 describe('buildEventOptions guest permissions and event types', () => {

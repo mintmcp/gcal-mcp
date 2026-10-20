@@ -158,6 +158,49 @@ describe('update_event guards', () => {
     expect(callsTo(PATCH_EVENT)).toHaveLength(0);
   });
 
+  it('refuses a plain field patch on a cancelled occurrence without sending it', async () => {
+    stub(GET_EVENT, { id: 'ev1', status: 'cancelled' });
+    const res = await run('update_event', { eventId: 'ev1', summary: 'Renamed' });
+    expect(res.isError).toBe(true);
+    expect(errorOf(res).error).toMatch(/no longer exists/);
+    expect(callsTo(PATCH_EVENT)).toHaveLength(0);
+  });
+
+  it('guards a plain field patch with the etag it read', async () => {
+    stub(GET_EVENT, { ...eventBody, etag: '"s1"' });
+    stub(PATCH_EVENT, eventBody);
+    await run('update_event', { eventId: 'ev1', summary: 'Renamed' });
+    const patch = only(PATCH_EVENT);
+    expect(patch.headers['If-Match']).toBe('"s1"');
+    expect(patch.body).toEqual({ summary: 'Renamed' });
+  });
+
+  it('refuses a visibility change on one occurrence and points to the series id', async () => {
+    stub(GET_EVENT, { ...eventBody, recurringEventId: 'series1' });
+    const res = await run('update_event', { eventId: 'ev1', visibility: 'private' });
+    expect(res.isError).toBe(true);
+    expect(errorOf(res)).toMatchObject({ recurringEventId: 'series1' });
+    expect(errorOf(res).error).toMatch(/whole series.*"series1"/);
+    expect(callsTo(PATCH_EVENT)).toHaveLength(0);
+  });
+
+  it('still patches other fields on one occurrence', async () => {
+    stub(GET_EVENT, { ...eventBody, recurringEventId: 'series1' });
+    stub(PATCH_EVENT, eventBody);
+    await run('update_event', { eventId: 'ev1', summary: 'Just this one' });
+    expect(only(PATCH_EVENT).body).toEqual({ summary: 'Just this one' });
+  });
+
+  it('gives format advice on a bad request only when the patch carried times', async () => {
+    const badRequest = { error: { message: 'Bad Request', errors: [{ reason: 'badRequest' }] } };
+    stub(GET_EVENT, eventBody);
+    stub(PATCH_EVENT, badRequest, 400);
+    const plain = errorOf(await run('update_event', { eventId: 'ev1', summary: 'Renamed' }));
+    expect(plain.error).toBe('Invalid request to update calendar event: Bad Request');
+    const timed = errorOf(await run('update_event', { eventId: 'ev1', start: '2026-10-21T10:00:00Z', end: '2026-10-21T11:00:00Z' }));
+    expect(timed.error).toMatch(/Check parameter formats/);
+  });
+
   it('refuses to make a stored focus-time event free', async () => {
     stub(GET_EVENT, { ...eventBody, eventType: 'focusTime' });
     const free = await run('update_event', { eventId: 'ev1', availability: 'free' });

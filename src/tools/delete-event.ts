@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { eventPath } from "../google/client.js";
-import { WRITE_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, sendUpdatesSchema } from "./schemas.js";
 
 export const deleteEvent = defineTool({
@@ -10,7 +10,6 @@ export const deleteEvent = defineTool({
     "Sends cancellation notifications to attendees by default; set `sendUpdates: 'none'` to delete silently. " +
     "Returns {success, eventId, message} on success. " +
     "If the event was already deleted, Google returns 410 and this tool surfaces a structured error; do not retry.",
-  scope: WRITE_SCOPE,
   destructiveHint: true,
   outputSchema: {
     success: z.boolean(),

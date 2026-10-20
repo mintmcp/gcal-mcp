@@ -1,9 +1,9 @@
 import { z } from "zod";
-import { HMS_RE, advanceToNextSlot, alignToSlotBoundary, isSlotBusy, isWithinSearchHours } from "../lib/availability.js";
+import { HMS_RE, addMinutes, alignToSlotBoundary, fitsWindow, hmsToSeconds, isSlotBusy, localClock } from "../lib/availability.js";
 import { getDayOfWeek, parseBound, toInstant, toLocalISO, type FormattedDateTime } from "../lib/datetime.js";
 import { formattedDateTimeSchema, type FreeBusyResponse } from "../lib/event-model.js";
 import { fail } from "../lib/failure.js";
-import { READ_SCOPE, defineTool } from "./define.js";
+import { defineTool } from "./define.js";
 import { calendarIdSchema, timeZoneSchema } from "./schemas.js";
 
 function formatSlotTime(date: Date, timeZone: string): FormattedDateTime {
@@ -27,10 +27,9 @@ export const getNextAvailability = defineTool({
     "`duration` is the desired meeting length in minutes. " +
     "Restrict to a daily window via `searchHoursStart`/`searchHoursEnd` (HH:MM[:SS] in `timezone`). " +
     "Restrict to specific weekdays via `includeDays` (default: Mon-Fri). " +
-    "Slots align to `startTimeIncrement` (default 30 min) boundaries. " +
+    "Slots align to `startTimeIncrement` (default 30 min) boundaries in `timezone`. " +
     "Returns up to `maxResults` slots (default 10) and a boolean `exhausted` flag: when `exhausted` is true, the full search window was scanned and no more slots exist; when false, paginate by calling again with `startFrom = searchedUntil`. " +
     "CAVEAT: free/busy reflects ONLY the listed calendars; meetings on other calendars the user attends are NOT considered. Surface this to the user before confirming a slot.",
-  scope: READ_SCOPE,
   readOnlyHint: true,
   outputSchema: {
     calendarId: z.string(),
@@ -107,22 +106,21 @@ export const getNextAvailability = defineTool({
     }
     busyTimes.sort((a, b) => a.start.getTime() - b.start.getTime());
 
-    const window = { timeZone: timezone, includeDays: p.includeDays, searchHoursStart: p.searchHoursStart, searchHoursEnd: p.searchHoursEnd };
+    const clock = localClock(timezone);
+    const window = {
+      days: p.includeDays,
+      startSeconds: p.searchHoursStart ? hmsToSeconds(p.searchHoursStart) : 0,
+      endSeconds: p.searchHoursEnd ? hmsToSeconds(p.searchHoursEnd) : 24 * 3600,
+    };
     const availableSlots: Array<{ start: FormattedDateTime; end: FormattedDateTime }> = [];
     let currentTime = new Date(searchStart);
     while (availableSlots.length < p.maxResults && currentTime < searchEnd) {
-      currentTime = alignToSlotBoundary(currentTime, p.startTimeIncrement);
-      const slotStart = new Date(currentTime);
-      const slotEnd = new Date(slotStart);
-      slotEnd.setMinutes(slotEnd.getMinutes() + p.duration);
-      if (
-        isWithinSearchHours(slotStart, { ...window, boundary: "start" })
-        && isWithinSearchHours(slotEnd, { ...window, boundary: "end" })
-        && !isSlotBusy(slotStart, slotEnd, busyTimes)
-      ) {
-        availableSlots.push({ start: formatSlotTime(slotStart, timezone), end: formatSlotTime(slotEnd, timezone) });
+      currentTime = alignToSlotBoundary(currentTime, p.startTimeIncrement, clock);
+      const slotEnd = addMinutes(currentTime, p.duration);
+      if (fitsWindow(clock(currentTime), clock(slotEnd), window) && !isSlotBusy(currentTime, slotEnd, busyTimes)) {
+        availableSlots.push({ start: formatSlotTime(currentTime, timezone), end: formatSlotTime(slotEnd, timezone) });
       }
-      currentTime = advanceToNextSlot(currentTime, p.startTimeIncrement);
+      currentTime = addMinutes(currentTime, p.startTimeIncrement);
     }
 
     const searchedUntil = currentTime > searchEnd ? searchEnd : currentTime;
