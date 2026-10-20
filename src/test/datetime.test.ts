@@ -159,6 +159,15 @@ describe("parseIso", () => {
     expect(parseIso("2026-13-45T10:00:00")).toBeNull();
     expect(parseIso("2026-10-20T10:00:00")).toEqual({ kind: "datetime", rfc3339: "2026-10-20T10:00:00", hasOffset: false });
   });
+
+  it("rejects dates and times that Date.parse would roll over", () => {
+    expect(parseIso("2026-02-29")).toBeNull();
+    expect(parseIso("2026-04-31T10:00")).toBeNull();
+    expect(parseIso("2026-02-31T10:00:00-03:00")).toBeNull();
+    expect(parseIso("2026-01-01T24:00:00")).toBeNull();
+    expect(parseIso("2028-02-29")).toEqual({ kind: "date", date: "2028-02-29" });
+    expect(parseIso("2026-10-20T10:00:00.500Z")).toEqual({ kind: "datetime", rfc3339: "2026-10-20T10:00:00.500Z", hasOffset: true });
+  });
 });
 
 describe("isValidTimeZone", () => {

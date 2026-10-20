@@ -23,6 +23,15 @@ describe("hmsToSeconds", () => {
 describe("fitsWindow", () => {
   const at = (iso: string) => utc(new Date(iso));
 
+  it("rejects a slot across a fall-back fold that starts at the window end or ends before its start", () => {
+    const ny = localClock("America/New_York");
+    const nyAt = (iso: string) => ny(new Date(iso));
+    const sunday = (start: string, end: string) => ({ days: ["Sun"], startSeconds: hmsToSeconds(start), endSeconds: hmsToSeconds(end) });
+    expect(fitsWindow(nyAt("2026-11-01T01:30:00-04:00"), nyAt("2026-11-01T01:30:00-05:00"), sunday("00:30", "01:30"))).toBe(false);
+    expect(fitsWindow(nyAt("2026-11-01T01:45:00-04:00"), nyAt("2026-11-01T01:15:00-05:00"), sunday("01:30", "02:00"))).toBe(false);
+    expect(fitsWindow(nyAt("2026-11-01T01:00:00-04:00"), nyAt("2026-11-01T01:00:00-05:00"), sunday("00:30", "02:00"))).toBe(true);
+  });
+
   it("accepts a slot inside the window", () => {
     expect(fitsWindow(at("2024-01-15T10:00:00Z"), at("2024-01-15T11:00:00Z"), nineToFive)).toBe(true);
   });

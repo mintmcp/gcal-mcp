@@ -32,16 +32,22 @@ export function hasOffset(dateTime: string): boolean {
   return OFFSET_RE.test(dateTime);
 }
 
+// Date.parse rolls impossible values over (Feb 29 in a common year becomes Mar 1, 24:00 the next day)
+function isRealCalendarTime(naive: string): boolean {
+  const ms = Date.parse(naive.length === 10 ? `${naive}T00:00:00Z` : `${naive}Z`);
+  return !Number.isNaN(ms) && new Date(ms).toISOString().startsWith(naive.slice(0, 19));
+}
+
 export function parseIso(input: string): ParsedIso | null {
   if (typeof input !== "string") return null;
   const s = input.trim();
   if (ISO_DATE_ONLY_RE.test(s)) {
-    return Number.isNaN(Date.parse(`${s}T00:00:00Z`)) ? null : { kind: "date", date: s };
+    return isRealCalendarTime(s) ? { kind: "date", date: s } : null;
   }
   const naive = s.replace(OFFSET_RE, "");
-  if (!ISO_DATETIME_NAIVE_RE.test(naive)) return null;
+  if (!ISO_DATETIME_NAIVE_RE.test(naive) || !isRealCalendarTime(naive)) return null;
   const offset = naive !== s;
-  if (Number.isNaN(Date.parse(offset ? s : `${s}Z`))) return null;
+  if (offset && Number.isNaN(Date.parse(s))) return null;
   return { kind: "datetime", rfc3339: s, hasOffset: offset };
 }
 

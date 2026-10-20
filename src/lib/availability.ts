@@ -61,15 +61,17 @@ export function fitsWindow(start: LocalClock, end: LocalClock, window: SearchWin
     }
     return true;
   }
+  // Across a fall-back fold the end clock can repeat or precede the start clock, so bound both ends on both sides
   return window.days.includes(weekdayOf(start.date))
     && start.seconds >= window.startSeconds
+    && start.seconds < window.endSeconds
+    && endSeconds > window.startSeconds
     && endSeconds <= window.endSeconds;
 }
 
 export function addMinutes(date: Date, minutes: number): Date {
   return new Date(date.getTime() + minutes * 60_000);
 }
-
 
 function hms(seconds: number): string {
   return [seconds / 3600, (seconds % 3600) / 60, seconds % 60].map((n) => String(Math.floor(n)).padStart(2, "0")).join(":");
