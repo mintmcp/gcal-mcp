@@ -1,4 +1,4 @@
-import { attachOffsetForTimezone, hasOffset, localInstant, parseBound, toLocalISO, type ParsedIso } from "./datetime.js";
+import { attachOffsetForTimezone, hasOffset, localInstant, parseBound, toZonedIso, type ParsedIso } from "./datetime.js";
 import { fail } from "./failure.js";
 import type { CalendarEvent, EventDateTime } from "./event-model.js";
 
@@ -113,7 +113,7 @@ export async function shiftedTimes(current: CalendarEvent, start: ParsedIso, inp
   const endMs = instantMs(newStart) + durationMs;
   if ("date" in newStart) return { start: newStart, end: { date: new Date(endMs).toISOString().slice(0, 10) } };
   const timeZone = await endZone();
-  return { start: newStart, end: { dateTime: toLocalISO(new Date(endMs), timeZone), timeZone } };
+  return { start: newStart, end: { dateTime: toZonedIso(new Date(endMs), timeZone), timeZone } };
 }
 
 export async function endOnlyTimes(current: CalendarEvent, end: ParsedIso, inputZone: Zone): Promise<TimePair> {

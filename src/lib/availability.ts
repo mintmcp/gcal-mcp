@@ -50,7 +50,9 @@ export function isFullDay(window: SearchWindow): boolean {
   return window.startSeconds === 0 && window.endSeconds === DAY_SECONDS;
 }
 
-export function fitsWindow(start: LocalClock, end: LocalClock, window: SearchWindow): boolean {
+export function fitsWindow(slot: Interval, clock: (date: Date) => LocalClock, window: SearchWindow): boolean {
+  const start = clock(slot.start);
+  const end = clock(slot.end);
   const endsAtMidnight = end.seconds === 0 && end.date > start.date;
   const lastDate = endsAtMidnight ? previousDay(end.date) : end.date;
   const endSeconds = endsAtMidnight ? DAY_SECONDS : end.seconds;
@@ -61,12 +63,11 @@ export function fitsWindow(start: LocalClock, end: LocalClock, window: SearchWin
     }
     return true;
   }
-  // Across a fall-back fold the end clock can repeat or precede the start clock, so bound both ends on both sides
+  // A slot crosses at most one clock change, so its local clock never leaves these bounds even inside a fall-back fold
+  const elapsed = (slot.end.getTime() - slot.start.getTime()) / 1000;
   return window.days.includes(weekdayOf(start.date))
-    && start.seconds >= window.startSeconds
-    && start.seconds < window.endSeconds
-    && endSeconds > window.startSeconds
-    && endSeconds <= window.endSeconds;
+    && Math.min(start.seconds, endSeconds - elapsed) >= window.startSeconds
+    && Math.max(start.seconds + elapsed, endSeconds) <= window.endSeconds;
 }
 
 export function addMinutes(date: Date, minutes: number): Date {

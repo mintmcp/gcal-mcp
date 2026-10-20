@@ -127,7 +127,7 @@ export const getNextAvailability = defineTool({
         break;
       }
       const slot = { start, end: addMinutes(start, p.duration) };
-      if (fitsWindow(clock(slot.start), clock(slot.end), window) && !isBusy(slot)) {
+      if (fitsWindow(slot, clock, window) && !isBusy(slot)) {
         availableSlots.push({ start: formatSlotTime(slot.start, timezone), end: formatSlotTime(slot.end, timezone) });
       }
     }

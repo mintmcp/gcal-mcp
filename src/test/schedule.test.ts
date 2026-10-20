@@ -81,7 +81,7 @@ describe('single-bound reschedules', () => {
     const start = parseRange('2026-10-22T15:00:00', '2026-10-22T16:00:00').start;
     expect(await shiftedTimes(timed, start, zone('America/Recife'), zone('America/Recife'))).toEqual({
       start: { dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' },
-      end: { dateTime: '2026-10-22T15:30:00', timeZone: 'America/Recife' },
+      end: { dateTime: '2026-10-22T15:30:00-03:00', timeZone: 'America/Recife' },
     });
   });
 
@@ -89,7 +89,16 @@ describe('single-bound reschedules', () => {
     const start = parseRange('2026-10-22T15:00:00', '2026-10-22T16:00:00').start;
     expect(await shiftedTimes(timed, start, zone('America/Recife'), zone('Europe/London'))).toEqual({
       start: { dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife' },
-      end: { dateTime: '2026-10-22T19:30:00', timeZone: 'Europe/London' },
+      end: { dateTime: '2026-10-22T19:30:00+01:00', timeZone: 'Europe/London' },
+    });
+  });
+
+  it('pins the offset of a derived end that lands in the repeated fall-back hour', async () => {
+    const hour = { id: 'e', start: { dateTime: '2026-10-30T09:00:00-04:00' }, end: { dateTime: '2026-10-30T10:00:00-04:00' } };
+    const start = parseRange('2026-11-01T01:30:00', '2026-11-01T02:00:00').start;
+    expect((await shiftedTimes(hour, start, zone('America/New_York'), zone('America/New_York'))).end).toEqual({
+      dateTime: '2026-11-01T01:30:00-05:00',
+      timeZone: 'America/New_York',
     });
   });
 

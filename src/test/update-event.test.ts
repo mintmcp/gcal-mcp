@@ -25,7 +25,7 @@ describe('update_event reschedule with one bound', () => {
     const patch = only(PATCH_EVENT);
     expect(patch.headers['If-Match']).toBe('"e9"');
     expect(patch.body.start).toEqual({ dateTime: '2026-10-22T15:00:00', timeZone: 'America/Recife', date: null });
-    expect(patch.body.end).toEqual({ dateTime: '2026-10-22T15:30:00', timeZone: 'America/Recife', date: null });
+    expect(patch.body.end).toEqual({ dateTime: '2026-10-22T15:30:00-03:00', timeZone: 'America/Recife', date: null });
   });
 
   it('keeps a new end when making an offset-only event recurring in the same call', async () => {
@@ -45,7 +45,7 @@ describe('update_event reschedule with one bound', () => {
     expect(calls).toHaveLength(2);
     const { body } = only(PATCH_EVENT);
     expect(body.start).toMatchObject({ dateTime: '2026-10-22T15:00:00-03:00', timeZone: 'Europe/Lisbon' });
-    expect(body.end).toMatchObject({ dateTime: '2026-10-22T19:30:00', timeZone: 'Europe/Lisbon' });
+    expect(body.end).toMatchObject({ dateTime: '2026-10-22T19:30:00+01:00', timeZone: 'Europe/Lisbon' });
   });
 
   it('shifts an all-day event by whole days when only a new start date is given', async () => {
@@ -133,7 +133,7 @@ describe('update_event time zones', () => {
 
     const startOnly = await patchFor({ start: '2026-10-20T19:00:00-04:00' }, flight);
     expect(startOnly.start).toEqual({ dateTime: '2026-10-20T19:00:00-04:00', timeZone: 'America/New_York', date: null });
-    expect(startOnly.end).toEqual({ dateTime: '2026-10-21T07:00:00', timeZone: 'Europe/London', date: null });
+    expect(startOnly.end).toEqual({ dateTime: '2026-10-21T07:00:00+01:00', timeZone: 'Europe/London', date: null });
   });
 
   it('keeps the series zone when a naive time is given on a calendar in another zone', async () => {

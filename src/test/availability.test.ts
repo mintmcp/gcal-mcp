@@ -21,50 +21,52 @@ describe("hmsToSeconds", () => {
 });
 
 describe("fitsWindow", () => {
-  const at = (iso: string) => utc(new Date(iso));
+  const slot = (start: string, end: string) => ({ start: new Date(start), end: new Date(end) });
 
-  it("rejects a slot across a fall-back fold that starts at the window end or ends before its start", () => {
-    const ny = localClock("America/New_York");
-    const nyAt = (iso: string) => ny(new Date(iso));
+  it("keeps a slot that crosses a fall-back fold inside the window for its whole length", () => {
     const sunday = (start: string, end: string) => ({ days: ["Sun"], startSeconds: hmsToSeconds(start), endSeconds: hmsToSeconds(end) });
-    expect(fitsWindow(nyAt("2026-11-01T01:30:00-04:00"), nyAt("2026-11-01T01:30:00-05:00"), sunday("00:30", "01:30"))).toBe(false);
-    expect(fitsWindow(nyAt("2026-11-01T01:45:00-04:00"), nyAt("2026-11-01T01:15:00-05:00"), sunday("01:30", "02:00"))).toBe(false);
-    expect(fitsWindow(nyAt("2026-11-01T01:00:00-04:00"), nyAt("2026-11-01T01:00:00-05:00"), sunday("00:30", "02:00"))).toBe(true);
+    const ny = localClock("America/New_York");
+    const london = localClock("Europe/London");
+    expect(fitsWindow(slot("2026-11-01T01:30:00-04:00", "2026-11-01T01:30:00-05:00"), ny, sunday("00:30", "01:30"))).toBe(false);
+    expect(fitsWindow(slot("2026-11-01T01:00:00-04:00", "2026-11-01T01:00:00-05:00"), ny, sunday("00:30", "01:30"))).toBe(false);
+    expect(fitsWindow(slot("2026-11-01T01:45:00-04:00", "2026-11-01T01:15:00-05:00"), ny, sunday("01:30", "02:00"))).toBe(false);
+    expect(fitsWindow(slot("2026-10-25T01:45:00+01:00", "2026-10-25T01:45:00+00:00"), london, sunday("01:30", "02:30"))).toBe(false);
+    expect(fitsWindow(slot("2026-11-01T01:00:00-04:00", "2026-11-01T01:00:00-05:00"), ny, sunday("00:00", "02:00"))).toBe(true);
   });
 
   it("accepts a slot inside the window", () => {
-    expect(fitsWindow(at("2024-01-15T10:00:00Z"), at("2024-01-15T11:00:00Z"), nineToFive)).toBe(true);
+    expect(fitsWindow(slot("2024-01-15T10:00:00Z", "2024-01-15T11:00:00Z"), utc, nineToFive)).toBe(true);
   });
 
   it("accepts a slot that ends exactly at the window end", () => {
-    expect(fitsWindow(at("2024-01-15T16:00:00Z"), at("2024-01-15T17:00:00Z"), nineToFive)).toBe(true);
+    expect(fitsWindow(slot("2024-01-15T16:00:00Z", "2024-01-15T17:00:00Z"), utc, nineToFive)).toBe(true);
   });
 
   it("rejects a slot that starts exactly at the window end", () => {
-    expect(fitsWindow(at("2024-01-15T17:00:00Z"), at("2024-01-15T17:30:00Z"), nineToFive)).toBe(false);
+    expect(fitsWindow(slot("2024-01-15T17:00:00Z", "2024-01-15T17:30:00Z"), utc, nineToFive)).toBe(false);
   });
 
   it("applies the weekday filter even when no hour window is set", () => {
-    expect(fitsWindow(at("2024-01-13T10:00:00Z"), at("2024-01-13T11:00:00Z"), allDay(weekdays))).toBe(false);
-    expect(fitsWindow(at("2024-01-13T10:00:00Z"), at("2024-01-13T11:00:00Z"), allDay(["Sat"]))).toBe(true);
+    expect(fitsWindow(slot("2024-01-13T10:00:00Z", "2024-01-13T11:00:00Z"), utc, allDay(weekdays))).toBe(false);
+    expect(fitsWindow(slot("2024-01-13T10:00:00Z", "2024-01-13T11:00:00Z"), utc, allDay(["Sat"]))).toBe(true);
   });
 
   it("rejects a slot whose end spills into an excluded day", () => {
-    expect(fitsWindow(at("2024-01-12T23:30:00Z"), at("2024-01-13T00:30:00Z"), allDay(weekdays))).toBe(false);
+    expect(fitsWindow(slot("2024-01-12T23:30:00Z", "2024-01-13T00:30:00Z"), utc, allDay(weekdays))).toBe(false);
   });
 
   it("rejects a slot that crosses into the next day of a bounded window", () => {
-    expect(fitsWindow(at("2026-10-19T09:00:00Z"), at("2026-10-20T09:00:00Z"), nineToFive)).toBe(false);
+    expect(fitsWindow(slot("2026-10-19T09:00:00Z", "2026-10-20T09:00:00Z"), utc, nineToFive)).toBe(false);
   });
 
   it("rejects an unrestricted multi-day slot that spans an excluded weekday", () => {
-    expect(fitsWindow(at("2024-01-12T12:00:00Z"), at("2024-01-15T12:00:00Z"), allDay(weekdays))).toBe(false);
-    expect(fitsWindow(at("2024-01-15T12:00:00Z"), at("2024-01-18T12:00:00Z"), allDay(weekdays))).toBe(true);
+    expect(fitsWindow(slot("2024-01-12T12:00:00Z", "2024-01-15T12:00:00Z"), utc, allDay(weekdays))).toBe(false);
+    expect(fitsWindow(slot("2024-01-15T12:00:00Z", "2024-01-18T12:00:00Z"), utc, allDay(weekdays))).toBe(true);
   });
 
   it("does not count the next day for a slot ending exactly at local midnight", () => {
-    expect(fitsWindow(at("2024-01-12T23:00:00Z"), at("2024-01-13T00:00:00Z"), allDay(weekdays))).toBe(true);
-    expect(fitsWindow(at("2024-01-11T12:00:00Z"), at("2024-01-13T00:00:00Z"), allDay(weekdays))).toBe(true);
+    expect(fitsWindow(slot("2024-01-12T23:00:00Z", "2024-01-13T00:00:00Z"), utc, allDay(weekdays))).toBe(true);
+    expect(fitsWindow(slot("2024-01-11T12:00:00Z", "2024-01-13T00:00:00Z"), utc, allDay(weekdays))).toBe(true);
   });
 });
 
