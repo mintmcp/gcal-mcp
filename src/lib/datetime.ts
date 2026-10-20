@@ -15,6 +15,19 @@ const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_DATETIME_NAIVE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?$/;
 const OFFSET_RE = /(?:Z|[+-]\d{2}:\d{2})$/;
 
+const FORMATS = {
+  offset: { timeZoneName: "longOffset" },
+  local: { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false },
+} satisfies Record<string, Intl.DateTimeFormatOptions>;
+const formatters = new Map<string, Intl.DateTimeFormat>();
+
+function formatter(timeZone: string, format: keyof typeof FORMATS): Intl.DateTimeFormat {
+  const key = `${format} ${timeZone}`;
+  const cached = formatters.get(key) ?? new Intl.DateTimeFormat("en-US", { ...FORMATS[format], timeZone });
+  formatters.set(key, cached);
+  return cached;
+}
+
 export function hasOffset(dateTime: string): boolean {
   return OFFSET_RE.test(dateTime);
 }
@@ -40,8 +53,7 @@ export function getOffset(timeZone: string, atInstant?: Date): string {
   if (timeZone === "UTC") return "Z";
   const probe = atInstant ?? new Date();
   if (Number.isNaN(probe.getTime())) return "Z";
-  const formatter = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" });
-  const offsetPart = formatter.formatToParts(probe).find((p) => p.type === "timeZoneName")?.value || "";
+  const offsetPart = formatter(timeZone, "offset").formatToParts(probe).find((p) => p.type === "timeZoneName")?.value || "";
   return offsetPart.replace("GMT", "").trim() || "Z";
 }
 
@@ -117,17 +129,7 @@ export function formatDateTimeWithDay(eventDateTime: { dateTime?: string; date?:
 }
 
 export function toLocalISO(date: Date, tz: string): string {
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-  const parts = formatter.formatToParts(date);
+  const parts = formatter(tz, "local").formatToParts(date);
   const getValue = (type: string) => parts.find((p) => p.type === type)?.value || "00";
   return `${getValue("year")}-${getValue("month")}-${getValue("day")}T${getValue("hour")}:${getValue("minute")}:${getValue("second")}`;
 }

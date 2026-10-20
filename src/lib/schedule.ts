@@ -42,13 +42,17 @@ export async function rangeTimes(range: ParsedRange, zone: Zone): Promise<TimePa
   };
 }
 
-// Google requires a named time zone on recurring timed events; an offset alone is rejected
 export function lacksNamedZone({ start, end }: TimePair): boolean {
   return "dateTime" in start && "dateTime" in end && !(start.timeZone && end.timeZone);
 }
 
 export function inZone({ start, end }: TimePair, timeZone: string): TimePair {
   return { start: { ...start, timeZone }, end: { ...end, timeZone } };
+}
+
+// Google requires a named time zone on recurring timed events; an offset alone is rejected
+export async function seriesTimes(times: TimePair, recurring: boolean, zone: Zone): Promise<TimePair> {
+  return recurring && lacksNamedZone(times) ? inZone(times, await zone()) : times;
 }
 
 function instantMs(time: EventTime): number {

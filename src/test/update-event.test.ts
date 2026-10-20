@@ -147,6 +147,27 @@ describe('update_event time zones', () => {
     expect(body.start).toMatchObject({ dateTime: '2026-10-20T10:00:00-04:00', timeZone: 'Europe/Lisbon' });
     expect(body.end).toMatchObject({ dateTime: '2026-10-20T16:00:00', timeZone: 'Europe/Lisbon' });
   });
+
+  it('moves a timed event into a time zone passed alone, keeping its instants', async () => {
+    const flight = { ...newYork, end: { dateTime: '2026-10-21T06:00:00+01:00', timeZone: 'Europe/London' } };
+    const body = await patchFor({ timeZone: 'Asia/Tokyo' }, flight);
+    expect(body.start).toEqual({ dateTime: '2026-10-20T10:00:00-04:00', timeZone: 'Asia/Tokyo', date: null });
+    expect(body.end).toEqual({ dateTime: '2026-10-21T06:00:00+01:00', timeZone: 'Asia/Tokyo', date: null });
+  });
+
+  it('moves a whole series into one time zone passed alone', async () => {
+    const body = await patchFor({ timeZone: 'Europe/London' }, { ...newYork, recurrence: ['RRULE:FREQ=WEEKLY'] });
+    expect(body.start).toEqual({ dateTime: '2026-10-20T10:00:00-04:00', timeZone: 'Europe/London', date: null });
+    expect(body.end).toEqual({ dateTime: '2026-10-20T11:00:00-04:00', timeZone: 'Europe/London', date: null });
+  });
+
+  it('rejects a time zone passed alone for an all-day event without patching', async () => {
+    stub(GET_EVENT, { ...eventBody, start: { date: '2026-10-20' }, end: { date: '2026-10-21' } });
+    const res = await run('update_event', { eventId: 'ev1', timeZone: 'Europe/London' });
+    expect(res.isError).toBe(true);
+    expect(errorOf(res).error).toMatch(/all-day/);
+    expect(callsTo(PATCH_EVENT)).toHaveLength(0);
+  });
 });
 
 describe('update_event guards', () => {

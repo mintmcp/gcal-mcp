@@ -9,11 +9,10 @@ import { renderMarkdown } from "../lib/markdown.js";
 import {
   assertOrdered,
   endOnlyTimes,
-  inZone,
-  lacksNamedZone,
   parseReschedule,
   rangeTimes,
   relabel,
+  seriesTimes,
   shiftedTimes,
   storedTimes,
   toPatchTime,
@@ -107,14 +106,21 @@ async function rescheduledTimes(p: UpdateArgs, reschedule: Reschedule, current: 
   return { start: relabel(times.start, labels.start), end: relabel(times.end, labels.end) };
 }
 
-async function rezonedSeriesTimes(p: UpdateArgs, current: CalendarEvent, client: CalendarClient): Promise<TimePair | undefined> {
+async function rezonedTimes(p: UpdateArgs, current: CalendarEvent, client: CalendarClient): Promise<TimePair | undefined> {
   const stored = storedTimes(current);
-  if (!stored || !isRecurring(p, current) || !lacksNamedZone(stored)) return undefined;
-  return inZone(stored, await seriesZone(p, current, client));
+  if (p.timeZone !== undefined) {
+    if (!stored || "date" in stored.start) {
+      fail("`timeZone` does not apply to an all-day event. To make it timed, pass both `start` and `end` as datetimes.");
+    }
+    return { start: relabel(stored.start, p.timeZone), end: relabel(stored.end, p.timeZone) };
+  }
+  if (!stored) return undefined;
+  const times = await seriesTimes(stored, isRecurring(p, current), () => seriesZone(p, current, client));
+  return times === stored ? undefined : times;
 }
 
 async function schedulePatch(p: UpdateArgs, reschedule: Reschedule | undefined, current: CalendarEvent, client: CalendarClient) {
-  const times = reschedule ? await rescheduledTimes(p, reschedule, current, client) : await rezonedSeriesTimes(p, current, client);
+  const times = reschedule ? await rescheduledTimes(p, reschedule, current, client) : await rezonedTimes(p, current, client);
   if (!times) return {};
   validateEventTypeTimes(current.eventType, times);
   assertOrdered(times);
@@ -163,7 +169,7 @@ export const updateEvent = defineTool({
     "Patch fields on an existing Google Calendar event by `eventId`. " +
     "Omit a field to leave it unchanged. Pass an empty string for `location` (or empty array for `attendees`) to CLEAR that field. " +
     "To reschedule, pass `start` and/or `end` as ISO 8601: date-only for all-day, datetime for timed. With only `start`, the event moves and keeps its duration; with only `end`, just the end changes. Pass neither to leave the schedule unchanged; pass both to change the kind (timed <-> all-day). The resulting `end` must be after `start`. " +
-    "Naive datetimes are read in `timeZone`, else the calendar's own time zone. Each endpoint keeps the time zone it already has unless `timeZone` is passed; a recurring series keeps one shared time zone. " +
+    "Naive datetimes are read in `timeZone`, else the calendar's own time zone. Each endpoint keeps the time zone it already has unless `timeZone` is passed; a recurring series keeps one shared time zone. `timeZone` alone (no `start`/`end`) moves a timed event into that zone keeping the same instants; it does not apply to all-day events. " +
     "`description` is rendered through Markdown to HTML by the server. " +
     "To add or remove guests, use `addAttendees` / `removeAttendees`: everyone else keeps their current response; removing someone who is not a guest is an error. " +
     "ATTENDEES WARNING: `attendees` REPLACES the entire attendee list and resets every responseStatus to needsAction; whether notifications are re-sent depends on `sendUpdates`. To accept/decline/tentatively respond for YOURSELF, use respond_to_event instead: it preserves everyone else's responses. " +

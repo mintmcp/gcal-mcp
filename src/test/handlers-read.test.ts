@@ -304,6 +304,16 @@ describe('get_next_availability', () => {
     expect(kathmandu.structuredContent.availableSlots.map((s: any) => s.start.time)).toEqual(['09:30:00', '10:00:00', '10:30:00']);
   });
 
+  it('steps a 45-minute grid from local midnight, starts after startFrom and pages from the next candidate', async () => {
+    stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });
+    const res = await run('get_next_availability', {
+      duration: 30, timezone: 'UTC', startFrom: '2026-10-20T09:00:30Z', startTimeIncrement: 45, maxResults: 3,
+    });
+    expect(res.structuredContent.availableSlots.map((s: any) => s.start.time)).toEqual(['09:45:00', '10:30:00', '11:15:00']);
+    expect(res.structuredContent.searchedUntil).toBe('2026-10-20T12:00:00');
+    expect(res.structuredContent.exhausted).toBe(false);
+  });
+
   it('falls back to the calendar time zone when none is given', async () => {
     stub(CALENDAR, calendarBody);
     stub(FREE_BUSY, { calendars: { primary: { busy: [] } } });

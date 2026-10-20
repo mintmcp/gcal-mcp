@@ -5,7 +5,7 @@ import { attendeeInputSchema, normalizeAttendees } from "../lib/attendees.js";
 import { buildEventOptions, eventOptionsInputSchema, eventTypeInputSchema, validateEventTypeTimes } from "../lib/event-options.js";
 import { eventSchema } from "../lib/event-model.js";
 import { renderMarkdown } from "../lib/markdown.js";
-import { assertOrdered, inZone, lacksNamedZone, parseRange, rangeTimes } from "../lib/schedule.js";
+import { assertOrdered, parseRange, rangeTimes, seriesTimes } from "../lib/schedule.js";
 import { defineTool } from "./define.js";
 import { calendarIdSchema, inputTimeZoneSchema, sendUpdatesSchema } from "./schemas.js";
 import { writeEvent } from "./write-event.js";
@@ -47,8 +47,7 @@ export const createEvent = defineTool({
     const attendees = p.attendees && p.attendees.length > 0 ? normalizeAttendees(p.attendees) : undefined;
 
     const zone = client.zone(p.calendarId, p.timeZone);
-    const rangeAsGiven = await rangeTimes(range, zone);
-    const times = options.recurrence?.length && lacksNamedZone(rangeAsGiven) ? inZone(rangeAsGiven, await zone()) : rangeAsGiven;
+    const times = await seriesTimes(await rangeTimes(range, zone), Boolean(options.recurrence?.length), zone);
     validateEventTypeTimes(options.eventType, times);
     assertOrdered(times);
 

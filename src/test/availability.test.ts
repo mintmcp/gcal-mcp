@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { addMinutes, alignToSlotBoundary, fitsWindow, hmsToSeconds, isSlotBusy, localClock } from "../lib/availability.js";
+import { addMinutes, fitsWindow, hmsToSeconds, isSlotBusy, localClock, slotStarts } from "../lib/availability.js";
+import { toLocalISO } from "../lib/datetime.js";
 
 const utc = localClock("UTC");
 const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri"];
@@ -8,7 +9,7 @@ const allDay = (days: string[]) => ({ days, startSeconds: 0, endSeconds: 24 * 36
 
 describe("localClock", () => {
   it("reads weekday, minute and seconds since midnight in the given zone", () => {
-    expect(localClock("Asia/Kathmandu")(new Date("2024-01-15T03:20:30Z"))).toEqual({ weekday: "Mon", minute: 5, seconds: 9 * 3600 + 5 * 60 + 30 });
+    expect(localClock("Asia/Kathmandu")(new Date("2024-01-15T03:20:30Z"))).toEqual({ weekday: "Mon", seconds: 9 * 3600 + 5 * 60 + 30 });
   });
 });
 
@@ -44,42 +45,75 @@ describe("fitsWindow", () => {
   });
 });
 
-describe("alignToSlotBoundary", () => {
-  it("returns an equal time when already aligned", () => {
-    const t = new Date("2024-01-15T10:00:00Z");
-    expect(alignToSlotBoundary(t, 30, utc).getTime()).toBe(t.getTime());
+describe("slotStarts", () => {
+  const take = (from: string, increment: number, zone: string, count = 4) => {
+    const out: string[] = [];
+    for (const start of slotStarts(new Date(from), increment, zone)) {
+      out.push(start.toISOString());
+      if (out.length === count) break;
+    }
+    return out;
+  };
+
+  it("starts at the given time when it is already on the grid", () => {
+    expect(take("2024-01-15T10:00:00Z", 30, "UTC", 2)).toEqual(["2024-01-15T10:00:00.000Z", "2024-01-15T10:30:00.000Z"]);
   });
 
-  it("rounds up 10:07 to 10:30 on a 30-minute grid", () => {
-    expect(alignToSlotBoundary(new Date("2024-01-15T10:07:00Z"), 30, utc).toISOString()).toBe("2024-01-15T10:30:00.000Z");
+  it("rounds up to the next grid point", () => {
+    expect(take("2024-01-15T10:07:00Z", 30, "UTC", 1)).toEqual(["2024-01-15T10:30:00.000Z"]);
+    expect(take("2024-01-15T10:01:00Z", 15, "UTC", 1)).toEqual(["2024-01-15T10:15:00.000Z"]);
   });
 
-  it("rounds up 10:01 to 10:15 on a 15-minute grid", () => {
-    expect(alignToSlotBoundary(new Date("2024-01-15T10:01:00Z"), 15, utc).toISOString()).toBe("2024-01-15T10:15:00.000Z");
+  it("never offers a start before the given time when it has seconds", () => {
+    expect(take("2024-01-15T10:00:30Z", 30, "UTC", 1)).toEqual(["2024-01-15T10:30:00.000Z"]);
+    expect(take("2024-01-15T10:30:17.123Z", 30, "UTC", 1)).toEqual(["2024-01-15T11:00:00.000Z"]);
   });
 
-  it("zeroes seconds and milliseconds even when the minute is already on the grid", () => {
-    expect(alignToSlotBoundary(new Date("2024-01-15T10:30:17.123Z"), 30, utc).toISOString()).toBe("2024-01-15T10:30:00.000Z");
+  it("counts a 45-minute grid from local midnight", () => {
+    expect(take("2024-01-15T00:10:00Z", 45, "UTC")).toEqual([
+      "2024-01-15T00:45:00.000Z",
+      "2024-01-15T01:30:00.000Z",
+      "2024-01-15T02:15:00.000Z",
+      "2024-01-15T03:00:00.000Z",
+    ]);
   });
 
-  it("does not mutate the input", () => {
-    const t = new Date("2024-01-15T10:07:42Z");
-    alignToSlotBoundary(t, 30, utc);
-    expect(t.toISOString()).toBe("2024-01-15T10:07:42.000Z");
+  it("counts a 90-minute grid from local midnight and restarts it each day", () => {
+    expect(take("2024-01-15T21:10:00Z", 90, "UTC")).toEqual([
+      "2024-01-15T22:30:00.000Z",
+      "2024-01-16T00:00:00.000Z",
+      "2024-01-16T01:30:00.000Z",
+      "2024-01-16T03:00:00.000Z",
+    ]);
+    expect(take("2024-01-15T23:00:00Z", 420, "UTC", 2)).toEqual(["2024-01-16T00:00:00.000Z", "2024-01-16T07:00:00.000Z"]);
   });
 
   it("aligns to local hours in a half-hour offset zone", () => {
-    const kolkata = localClock("Asia/Kolkata");
-    const out = alignToSlotBoundary(new Date("2024-01-15T03:40:00Z"), 60, kolkata);
-    expect(out.toISOString()).toBe("2024-01-15T04:30:00.000Z");
-    expect(kolkata(out).minute).toBe(0);
+    expect(take("2024-01-15T03:40:00Z", 60, "Asia/Kolkata", 2)).toEqual(["2024-01-15T04:30:00.000Z", "2024-01-15T05:30:00.000Z"]);
   });
 
   it("aligns to local half hours in a quarter-hour offset zone", () => {
-    const kathmandu = localClock("Asia/Kathmandu");
-    const out = alignToSlotBoundary(new Date("2024-01-15T03:20:00Z"), 30, kathmandu);
-    expect(out.toISOString()).toBe("2024-01-15T03:45:00.000Z");
-    expect(kathmandu(out).minute).toBe(30);
+    expect(take("2024-01-15T03:20:00Z", 30, "Asia/Kathmandu", 2)).toEqual(["2024-01-15T03:45:00.000Z", "2024-01-15T04:15:00.000Z"]);
+  });
+
+  it("skips the local times a half-hour daylight-saving shift removes", () => {
+    const lordHowe = take("2024-10-06T01:50:00+10:30", 60, "Australia/Lord_Howe", 2).map((iso) => toLocalISO(new Date(iso), "Australia/Lord_Howe"));
+    expect(lordHowe).toEqual(["2024-10-06T03:00:00", "2024-10-06T04:00:00"]);
+  });
+
+  it("skips the missing hour when New York springs forward", () => {
+    const local = take("2024-03-10T01:00:00-05:00", 30, "America/New_York", 4).map((iso) => toLocalISO(new Date(iso), "America/New_York"));
+    expect(local).toEqual(["2024-03-10T01:00:00", "2024-03-10T01:30:00", "2024-03-10T03:00:00", "2024-03-10T03:30:00"]);
+  });
+
+  it("offers the repeated hour once, at the earlier offset, when New York falls back", () => {
+    expect(take("2024-11-03T00:30:00-04:00", 30, "America/New_York", 5)).toEqual([
+      "2024-11-03T04:30:00.000Z",
+      "2024-11-03T05:00:00.000Z",
+      "2024-11-03T05:30:00.000Z",
+      "2024-11-03T07:00:00.000Z",
+      "2024-11-03T07:30:00.000Z",
+    ]);
   });
 });
 
