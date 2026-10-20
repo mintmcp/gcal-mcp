@@ -15,17 +15,15 @@ const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_DATETIME_NAIVE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?$/;
 const OFFSET_RE = /(?:Z|[+-]\d{2}:\d{2})$/;
 
-const FORMATS = {
-  offset: { timeZoneName: "longOffset" },
-  local: { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false },
-} satisfies Record<string, Intl.DateTimeFormatOptions>;
-const formatters = new Map<string, Intl.DateTimeFormat>();
+const offsetFormatters = new Map<string, Intl.DateTimeFormat>();
 
-function formatter(timeZone: string, format: keyof typeof FORMATS): Intl.DateTimeFormat {
-  const key = `${format} ${timeZone}`;
-  const cached = formatters.get(key) ?? new Intl.DateTimeFormat("en-US", { ...FORMATS[format], timeZone });
-  formatters.set(key, cached);
-  return cached;
+// Historic local mean time offsets carry seconds (-04:56:02) that RFC 3339 cannot express, so every local clock here drops them
+function offsetMinutes(timeZone: string, date: Date): number {
+  const cached = offsetFormatters.get(timeZone) ?? new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" });
+  offsetFormatters.set(timeZone, cached);
+  const name = cached.formatToParts(date).find((p) => p.type === "timeZoneName")?.value ?? "";
+  const match = /^GMT([+-])(\d{2}):(\d{2})/.exec(name);
+  return match ? (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3])) : 0;
 }
 
 export function hasOffset(dateTime: string): boolean {
@@ -59,9 +57,9 @@ export function getOffset(timeZone: string, atInstant?: Date): string {
   if (timeZone === "UTC") return "Z";
   const probe = atInstant ?? new Date();
   if (Number.isNaN(probe.getTime())) return "Z";
-  const offsetPart = formatter(timeZone, "offset").formatToParts(probe).find((p) => p.type === "timeZoneName")?.value || "";
-  // Historic local mean time offsets carry seconds (-04:56:02), which RFC 3339 cannot express
-  return offsetPart.replace("GMT", "").trim().replace(/^([+-]\d{2}:\d{2}):\d{2}$/, "$1") || "Z";
+  const minutes = offsetMinutes(timeZone, probe);
+  const abs = Math.abs(minutes);
+  return `${minutes < 0 ? "-" : "+"}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -138,7 +136,5 @@ export function formatDateTimeWithDay(eventDateTime: { dateTime?: string; date?:
 }
 
 export function toLocalISO(date: Date, tz: string): string {
-  const parts = formatter(tz, "local").formatToParts(date);
-  const getValue = (type: string) => parts.find((p) => p.type === type)?.value || "00";
-  return `${getValue("year")}-${getValue("month")}-${getValue("day")}T${getValue("hour")}:${getValue("minute")}:${getValue("second")}`;
+  return new Date(date.getTime() + offsetMinutes(tz, date) * 60_000).toISOString().slice(0, 19);
 }

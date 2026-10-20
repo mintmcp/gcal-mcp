@@ -21,22 +21,9 @@ export function hmsToSeconds(hms: string): number {
 }
 
 export function localClock(timeZone: string): (date: Date) => LocalClock {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  });
   return (date) => {
-    const parts = Object.fromEntries(formatter.formatToParts(date).map((p) => [p.type, p.value]));
-    return {
-      date: `${parts.year}-${parts.month}-${parts.day}`,
-      seconds: Number(parts.hour) * 3600 + Number(parts.minute) * 60 + Number(parts.second),
-    };
+    const [day, time] = toLocalISO(date, timeZone).split("T");
+    return { date: day, seconds: hmsToSeconds(time) };
   };
 }
 

@@ -72,7 +72,7 @@ function repeatedLocalTime(time: EventTime): string | undefined {
   const instant = Date.parse(time.dateTime);
   const wall = toLocalISO(new Date(instant), time.timeZone);
   const resolved = Date.parse(attachOffsetForTimezone(wall, time.timeZone));
-  if (Math.abs(resolved - instant) < 60_000) return undefined;
+  if (Math.abs(resolved - instant) < 1000) return undefined;
   return `${time.dateTime} (${wall} in ${time.timeZone})`;
 }
 
