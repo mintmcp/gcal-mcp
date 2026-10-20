@@ -1,9 +1,5 @@
-// Google Calendar event/calendar wire types, the structured shapes the tools
-// return, and the zod output schemas describing them
-
 import { z } from "zod";
 import { formatDateTimeWithDay } from "./datetime.js";
-import type { EventAttachment } from "./event-fields.js";
 
 export interface ConferenceEntryPoint {
   entryPointType: string;
@@ -21,11 +17,30 @@ export interface ConferenceData {
 }
 
 export interface EventAttendee {
-  email: string;
+  email?: string;
+  displayName?: string;
   responseStatus?: string;
+  optional?: boolean;
+  organizer?: boolean;
   self?: boolean;
+  resource?: boolean;
+  additionalGuests?: number;
   comment?: string;
   [key: string]: unknown;
+}
+
+export interface EventAttachment {
+  fileUrl: string;
+  title?: string;
+  fileId?: string;
+  mimeType?: string;
+  [key: string]: unknown;
+}
+
+export interface EventDateTime {
+  dateTime?: string;
+  date?: string;
+  timeZone?: string;
 }
 
 export interface EventPerson {
@@ -36,7 +51,7 @@ export interface EventPerson {
 
 export interface CalendarEvent {
   id: string;
-  summary: string;
+  summary?: string;
   organizer?: EventPerson;
   creator?: EventPerson;
   colorId?: string;
@@ -45,23 +60,11 @@ export interface CalendarEvent {
   eventType?: string;
   reminders?: { useDefault?: boolean; overrides?: Array<{ method: string; minutes: number }> };
   created?: string;
-  start: {
-    dateTime?: string;
-    date?: string;
-    timeZone?: string;
-  };
-  end: {
-    dateTime?: string;
-    date?: string;
-    timeZone?: string;
-  };
+  start?: EventDateTime;
+  end?: EventDateTime;
   recurrence?: string[];
   recurringEventId?: string;
-  originalStartTime?: {
-    dateTime?: string;
-    date?: string;
-    timeZone?: string;
-  };
+  originalStartTime?: EventDateTime;
   description?: string;
   location?: string;
   attendees?: EventAttendee[];
@@ -118,9 +121,6 @@ export interface FreeBusyResponse {
   };
 }
 
-// Reusable output schema fragments.
-// All schemas use .passthrough() + inner-optional fields so undocumented
-// Google Calendar response fields don't trigger output validation errors.
 export const formattedDateTimeSchema = z.object({
   date: z.string().optional(),
   time: z.string().optional(),
@@ -234,12 +234,26 @@ function toAttachments(attachments: EventAttachment[] | undefined) {
   return out.length > 0 ? out : undefined;
 }
 
+function toAttendee(a: EventAttendee) {
+  if (typeof a.email !== 'string') return [];
+  return [{
+    email: a.email,
+    responseStatus: a.responseStatus || null,
+    ...(typeof a.displayName === 'string' && a.displayName && { displayName: a.displayName }),
+    ...(a.optional === true && { optional: true }),
+    ...(a.organizer === true && { organizer: true }),
+    ...(a.self === true && { self: true }),
+    ...(typeof a.additionalGuests === 'number' && a.additionalGuests > 0 && { additionalGuests: a.additionalGuests }),
+    ...(a.resource === true && { resource: true }),
+  }];
+}
+
 function toPerson(p: EventPerson | undefined) {
   if (!p || typeof p.email !== 'string') return undefined;
   return { email: p.email, ...(p.displayName && { displayName: p.displayName }) };
 }
 
-export function sanitizeConferenceData(cd?: CalendarEvent['conferenceData']): ConferenceData | undefined {
+function sanitizeConferenceData(cd?: CalendarEvent['conferenceData']): ConferenceData | undefined {
   if (!cd) return undefined;
   const sanitized: ConferenceData = {};
   if (Array.isArray(cd.entryPoints)) {
@@ -266,6 +280,8 @@ export function toStructuredEvent(event: CalendarEvent) {
   const sanitizedConf = sanitizeConferenceData(event.conferenceData);
   const attachments = toAttachments(event.attachments);
   const guestPermissions = toGuestPermissions(event);
+  const organizer = toPerson(event.organizer);
+  const creator = toPerson(event.creator);
   return {
     id: event.id,
     summary: event.summary || 'Untitled Event',
@@ -273,25 +289,10 @@ export function toStructuredEvent(event: CalendarEvent) {
     end: formatDateTimeWithDay(event.end),
     location: event.location || null,
     description: event.description || null,
-    attendees: event.attendees
-      ? event.attendees
-          .filter(a => typeof a.email === 'string')
-          .map(a => ({
-            email: a.email,
-            responseStatus: a.responseStatus || null,
-            ...(typeof a.displayName === 'string' && a.displayName && { displayName: a.displayName }),
-            ...(a.optional === true && { optional: true }),
-            ...(a.organizer === true && { organizer: true }),
-            ...(a.self === true && { self: true }),
-            ...(typeof a.additionalGuests === 'number' && a.additionalGuests > 0 && { additionalGuests: a.additionalGuests }),
-            ...(a.resource === true && { resource: true }),
-          }))
-      : [],
-    // attendeesOmitted signals Google truncated a large guest list;
-    // surface it so callers know the roster may be incomplete.
+    attendees: (event.attendees ?? []).flatMap(toAttendee),
     ...(event.attendeesOmitted === true && { attendeesOmitted: true }),
-    ...(toPerson(event.organizer) && { organizer: toPerson(event.organizer) }),
-    ...(toPerson(event.creator) && { creator: toPerson(event.creator) }),
+    ...(organizer && { organizer }),
+    ...(creator && { creator }),
     ...(typeof event.colorId === 'string' && { colorId: event.colorId }),
     ...(typeof event.visibility === 'string' && { visibility: event.visibility }),
     availability: event.transparency === 'transparent' ? 'free' : 'busy',
@@ -300,10 +301,6 @@ export function toStructuredEvent(event: CalendarEvent) {
     ...(typeof event.status === 'string' && { status: event.status }),
     ...(typeof event.created === 'string' && { created: event.created }),
     ...(typeof event.updated === 'string' && { updated: event.updated }),
-    // Recurrence markers let a caller tell a series master (has `recurrence`
-    // RRULEs) from a single instance (has `recurringEventId`), navigate an
-    // instance back to its series, and detect a moved occurrence by comparing
-    // `originalStartTime` against `start`.
     ...(Array.isArray(event.recurrence) && event.recurrence.length > 0 && { recurrence: event.recurrence }),
     ...(typeof event.recurringEventId === 'string' && { recurringEventId: event.recurringEventId }),
     ...(event.originalStartTime && { originalStartTime: formatDateTimeWithDay(event.originalStartTime) }),

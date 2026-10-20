@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { describeAttendeeRoster, identifyCallerAttendee, truncateBody } from '../tools.js';
+import { truncateBody } from '../google/client.js';
+import { describeAttendeeRoster } from '../lib/event-fields.js';
+import { identifyCallerAttendee } from '../tools/respond-to-event.js';
 import { toStructuredEvent } from '../lib/event-model.js';
 
 const caller = 'me@example.com';

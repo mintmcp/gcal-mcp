@@ -1,8 +1,3 @@
-// Pure datetime / attendee helpers used by the Google Calendar tools.
-// Extracted from src/tools.ts so they can be unit-tested without spinning up
-// the MCP transport or stubbing fetch. NOTHING here should perform I/O —
-// helpers operate only on their arguments.
-
 export type ParsedIso =
   | { kind: "date"; date: string } // YYYY-MM-DD
   | { kind: "datetime"; rfc3339: string; hasOffset: boolean };
@@ -45,6 +40,7 @@ export function parseIso(input: string): ParsedIso | null {
     return { kind: "datetime", rfc3339: s, hasOffset: true };
   }
   if (ISO_DATETIME_NAIVE_RE.test(s)) {
+    if (Number.isNaN(new Date(`${s}Z`).getTime())) return null;
     return { kind: "datetime", rfc3339: s, hasOffset: false };
   }
   return null;
@@ -83,15 +79,10 @@ export function attachOffsetForTimezone(naiveIso: string, timeZone: string): str
     throw new Error(`attachOffsetForTimezone: cannot parse naive ISO "${naiveIso}"`);
   }
   if (timeZone === "UTC") return `${naiveIso}Z`;
-  // The wall-clock time is first read as UTC to get a nearby instant, then
-  // re-read with that offset applied so a DST switch between the two instants
-  // yields the offset actually in force at the requested local time
   const nearby = getOffset(timeZone, new Date(`${naiveIso}Z`));
   const offset = getOffset(timeZone, new Date(`${naiveIso}${nearby}`));
   if (offset === nearby || wallClockMatches(naiveIso, offset, timeZone)) return `${naiveIso}${offset}`;
-  // The wall-clock time does not exist (spring-forward gap). Using the
-  // pre-transition offset lands one hour later on the clock, which is what
-  // the Google Calendar UI does with such times
+  // Google Calendar moves a local time inside a spring-forward gap one hour later
   const preTransition = offsetMinutes(offset) < offsetMinutes(nearby) ? offset : nearby;
   return `${naiveIso}${preTransition}`;
 }
@@ -106,6 +97,33 @@ function offsetMinutes(offset: string): number {
 function wallClockMatches(naiveIso: string, offset: string, timeZone: string): boolean {
   const local = toLocalISO(new Date(`${naiveIso}${offset}`), timeZone);
   return local.startsWith(naiveIso.slice(0, 19));
+}
+
+export function localTimeExists(naiveIso: string, timeZone: string): boolean {
+  return wallClockMatches(naiveIso, attachOffsetForTimezone(naiveIso, timeZone).slice(naiveIso.length), timeZone);
+}
+
+export function isValidTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function needsZone(parsed: ParsedIso): boolean {
+  return parsed.kind === "date" || !parsed.hasOffset;
+}
+
+export function toInstant(parsed: ParsedIso, timeZone: string): string {
+  if (parsed.kind === "date") return attachOffsetForTimezone(`${parsed.date}T00:00:00`, timeZone);
+  return parsed.hasOffset ? parsed.rfc3339 : attachOffsetForTimezone(parsed.rfc3339, timeZone);
+}
+
+export async function resolveInstant(parsed: ParsedIso, zone: () => Promise<string>): Promise<string> {
+  if (parsed.kind === "datetime" && parsed.hasOffset) return parsed.rfc3339;
+  return toInstant(parsed, await zone());
 }
 
 /**
@@ -177,40 +195,6 @@ export function formatDateTimeWithDay(eventDateTime: {
     date: "",
     dayOfWeek: "",
   };
-}
-
-/**
- * Normalise a heterogeneous attendee input array (bare emails or
- * `{ email, displayName?, optional?, ... }` objects) into the shape Google
- * Calendar expects. Drops empty `displayName`s and only sets the boolean
- * flags when explicitly true.
- */
-export interface AttendeeInput {
-  email: string;
-  displayName?: string;
-  optional?: boolean;
-  additionalGuests?: number;
-  resource?: boolean;
-  responseStatus?: string;
-  [key: string]: unknown;
-}
-
-export function normalizeAttendees(
-  input: Array<string | AttendeeInput> | undefined,
-): AttendeeInput[] | undefined {
-  if (!input) return undefined;
-  return input.map((a) => {
-    if (typeof a === "string") return { email: a };
-    const out: AttendeeInput = { email: a.email };
-    if (typeof a.displayName === "string" && a.displayName.length > 0) {
-      out.displayName = a.displayName;
-    }
-    if (a.optional === true) out.optional = true;
-    if (typeof a.additionalGuests === "number" && a.additionalGuests > 0) out.additionalGuests = a.additionalGuests;
-    if (a.resource === true) out.resource = true;
-    if (typeof a.responseStatus === "string") out.responseStatus = a.responseStatus;
-    return out;
-  });
 }
 
 // ---------- get_next_availability slot helpers ----------

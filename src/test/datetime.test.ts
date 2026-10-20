@@ -4,11 +4,15 @@ import {
   formatDateTimeWithDay,
   getOffset,
   attachOffsetForTimezone,
-  normalizeAttendees,
   isWithinSearchHours,
   alignToSlotBoundary,
   advanceToNextSlot,
   isSlotBusy,
+  isValidTimeZone,
+  localTimeExists,
+  parseIso,
+  resolveInstant,
+  toInstant,
 } from "../lib/datetime.js";
 
 describe("getDayOfWeek", () => {
@@ -141,49 +145,6 @@ describe("attachOffsetForTimezone", () => {
     expect(() => attachOffsetForTimezone("not-a-date", "UTC")).toThrow(
       /cannot parse naive ISO/,
     );
-  });
-});
-
-describe("normalizeAttendees", () => {
-  it("returns undefined for undefined input", () => {
-    expect(normalizeAttendees(undefined)).toBeUndefined();
-  });
-
-  it("returns empty array for empty input", () => {
-    expect(normalizeAttendees([])).toEqual([]);
-  });
-
-  it("normalises bare email strings to { email }", () => {
-    expect(normalizeAttendees(["a@x.com", "b@x.com"])).toEqual([
-      { email: "a@x.com" },
-      { email: "b@x.com" },
-    ]);
-  });
-
-  it("preserves displayName and optional=true when set", () => {
-    expect(
-      normalizeAttendees([
-        { email: "a@x.com", displayName: "Alice", optional: true },
-      ]),
-    ).toEqual([{ email: "a@x.com", displayName: "Alice", optional: true }]);
-  });
-
-  it("omits optional when it is false (only sets when truly true)", () => {
-    expect(
-      normalizeAttendees([{ email: "a@x.com", optional: false }]),
-    ).toEqual([{ email: "a@x.com" }]);
-  });
-
-  it("omits empty displayName", () => {
-    expect(
-      normalizeAttendees([{ email: "a@x.com", displayName: "" }]),
-    ).toEqual([{ email: "a@x.com" }]);
-  });
-
-  it("mixes bare emails and objects in one list", () => {
-    expect(
-      normalizeAttendees(["a@x.com", { email: "b@x.com", displayName: "B" }]),
-    ).toEqual([{ email: "a@x.com" }, { email: "b@x.com", displayName: "B" }]);
   });
 });
 
@@ -368,16 +329,43 @@ describe("isSlotBusy", () => {
   });
 });
 
-describe("normalizeAttendees extras", () => {
-  it("keeps additionalGuests, resource and responseStatus when given", () => {
-    expect(normalizeAttendees([
-      { email: "room@example.com", resource: true },
-      { email: "a@example.com", additionalGuests: 2, responseStatus: "accepted" },
-      { email: "b@example.com", additionalGuests: 0, resource: false },
-    ])).toEqual([
-      { email: "room@example.com", resource: true },
-      { email: "a@example.com", additionalGuests: 2, responseStatus: "accepted" },
-      { email: "b@example.com" },
-    ]);
+describe("parseIso", () => {
+  it("rejects a naive datetime whose calendar date does not exist", () => {
+    expect(parseIso("2026-13-45T10:00:00")).toBeNull();
+    expect(parseIso("2026-10-20T10:00:00")).toEqual({ kind: "datetime", rfc3339: "2026-10-20T10:00:00", hasOffset: false });
+  });
+});
+
+describe("isValidTimeZone", () => {
+  it("accepts IANA names and rejects made-up ones", () => {
+    expect(isValidTimeZone("America/New_York")).toBe(true);
+    expect(isValidTimeZone("UTC")).toBe(true);
+    expect(isValidTimeZone("Not/AZone")).toBe(false);
+  });
+});
+
+describe("localTimeExists", () => {
+  it("reports a wall-clock time inside a spring-forward gap as nonexistent", () => {
+    expect(localTimeExists("2027-03-14T02:30:00", "America/New_York")).toBe(false);
+    expect(localTimeExists("2027-03-14T03:30:00", "America/New_York")).toBe(true);
+    expect(localTimeExists("2027-11-07T01:30:00", "America/New_York")).toBe(true);
+    expect(localTimeExists("2027-03-14T02:30:00", "UTC")).toBe(true);
+  });
+});
+
+describe("toInstant", () => {
+  it("anchors dates at local midnight, naive times in the zone, and keeps explicit offsets", () => {
+    expect(toInstant({ kind: "date", date: "2026-10-20" }, "America/Recife")).toBe("2026-10-20T00:00:00-03:00");
+    expect(toInstant({ kind: "datetime", rfc3339: "2026-10-20T10:00:00", hasOffset: false }, "America/Recife")).toBe("2026-10-20T10:00:00-03:00");
+    expect(toInstant({ kind: "datetime", rfc3339: "2026-10-20T10:00:00Z", hasOffset: true }, "America/Recife")).toBe("2026-10-20T10:00:00Z");
+  });
+
+  it("only asks for the zone when the input needs one", async () => {
+    let asked = 0;
+    const zone = async () => { asked++; return "America/Recife"; };
+    expect(await resolveInstant({ kind: "datetime", rfc3339: "2026-10-20T10:00:00Z", hasOffset: true }, zone)).toBe("2026-10-20T10:00:00Z");
+    expect(asked).toBe(0);
+    expect(await resolveInstant({ kind: "date", date: "2026-10-20" }, zone)).toBe("2026-10-20T00:00:00-03:00");
+    expect(asked).toBe(1);
   });
 });

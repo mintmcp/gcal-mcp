@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { buildEventOptions, mergeAttachments, mergeAttendees, normalizeAttachments, type AttendeeLike } from '../lib/event-fields.js';
+import {
+  buildEventOptions,
+  describeAttendeeRoster,
+  mergeAttachments,
+  mergeAttendees,
+  normalizeAttachments,
+  normalizeAttendees,
+  validateEventTypeTimes,
+  withEventTypeHint,
+} from '../lib/event-fields.js';
+import type { EventAttendee } from '../lib/event-model.js';
+import { ToolFailure } from '../lib/failure.js';
 
 describe('buildEventOptions', () => {
   it('returns an empty body when no option is set', () => {
@@ -50,7 +61,7 @@ describe('buildEventOptions', () => {
 });
 
 describe('mergeAttendees', () => {
-  const existing: AttendeeLike[] = [
+  const existing: EventAttendee[] = [
     { email: 'a@example.com', responseStatus: 'accepted' },
     { email: 'B@example.com', responseStatus: 'declined', optional: true },
   ];
@@ -67,6 +78,10 @@ describe('mergeAttendees', () => {
 
   it('removes by email case-insensitively', () => {
     expect(mergeAttendees(existing, [], ['A@example.com'])).toEqual([existing[1]]);
+  });
+
+  it('rejects removing someone who is not a guest instead of silently doing nothing', () => {
+    expect(() => mergeAttendees(existing, [], ['nobody@example.com'])).toThrow(/nobody@example.com/);
   });
 
   it('applies removals before additions so a re-added person starts fresh', () => {
@@ -93,10 +108,12 @@ describe('buildEventOptions guest permissions and event types', () => {
       outOfOffice: { autoDeclineMode: 'declineAllConflictingInvitations', declineMessage: 'Away' },
     })).toEqual({
       eventType: 'outOfOffice',
+      transparency: 'opaque',
       outOfOfficeProperties: { autoDeclineMode: 'declineAllConflictingInvitations', declineMessage: 'Away' },
     });
     expect(buildEventOptions({ eventType: 'outOfOffice' })).toEqual({
       eventType: 'outOfOffice',
+      transparency: 'opaque',
       outOfOfficeProperties: { autoDeclineMode: 'declineAllConflictingInvitations' },
     });
   });
@@ -107,10 +124,12 @@ describe('buildEventOptions guest permissions and event types', () => {
       focusTime: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
     })).toEqual({
       eventType: 'focusTime',
+      transparency: 'opaque',
       focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
     });
     expect(buildEventOptions({ eventType: 'focusTime' })).toEqual({
       eventType: 'focusTime',
+      transparency: 'opaque',
       focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'doNotDisturb' },
     });
   });
@@ -133,13 +152,21 @@ describe('buildEventOptions guest permissions and event types', () => {
     });
   });
 
+  it('refuses to make out-of-office or focus time free, since Google needs them to block time', () => {
+    expect(() => buildEventOptions({ eventType: 'focusTime', availability: 'free' })).toThrow(/busy/);
+    expect(() => buildEventOptions({ outOfOffice: {}, availability: 'free' })).toThrow(/busy/);
+    expect(buildEventOptions({ eventType: 'focusTime', availability: 'busy' })).toMatchObject({ transparency: 'opaque' });
+  });
+
   it('refuses to make a working location private or busy', () => {
     expect(() => buildEventOptions({ eventType: 'workingLocation', visibility: 'private' })).toThrow(/public/);
     expect(() => buildEventOptions({ eventType: 'workingLocation', availability: 'busy' })).toThrow(/free/);
   });
 
-  it('requires a label for a custom working location and defaults to home office', () => {
-    expect(() => buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation' } })).toThrow(/label/);
+  it('accepts a custom working location without a label and defaults to home office', () => {
+    expect(buildEventOptions({ eventType: 'workingLocation', workingLocation: { type: 'customLocation' } })).toMatchObject({
+      workingLocationProperties: { type: 'customLocation', customLocation: {} },
+    });
     expect(buildEventOptions({ eventType: 'workingLocation' })).toMatchObject({
       workingLocationProperties: { type: 'homeOffice', homeOffice: {} },
     });
@@ -148,6 +175,7 @@ describe('buildEventOptions guest permissions and event types', () => {
   it('infers the event type from the settings given, and rejects settings for another type', () => {
     expect(buildEventOptions({ focusTime: { chatStatus: 'available' } })).toEqual({
       eventType: 'focusTime',
+      transparency: 'opaque',
       focusTimeProperties: { autoDeclineMode: 'declineNone', chatStatus: 'available' },
     });
     expect(() => buildEventOptions({ eventType: 'default', focusTime: { chatStatus: 'available' } })).toThrow(/focusTime/);
@@ -173,6 +201,10 @@ describe('normalizeAttachments', () => {
   it('rejects anything that is neither a URL nor a Drive file id', () => {
     expect(() => normalizeAttachments(['not a file'])).toThrow(/Drive/);
   });
+
+  it('refuses more than 25 attachments up front', () => {
+    expect(() => normalizeAttachments(Array.from({ length: 26 }, (_, i) => `file${i}`))).toThrow(/25/);
+  });
 });
 
 describe('mergeAttachments', () => {
@@ -189,6 +221,11 @@ describe('mergeAttachments', () => {
     expect(mergeAttachments(existing, [], ['https://docs.google.com/document/d/1gone/edit'])).toEqual([existing[0]]);
   });
 
+  it('rejects removing an attachment the event does not have', () => {
+    expect(() => mergeAttachments(existing, [], ['1missing'])).toThrow(/1missing/);
+    expect(() => mergeAttachments(existing, [], ['not a file'])).toThrow(/Drive/);
+  });
+
   it('refuses to grow past the 25 attachments Google allows', () => {
     const many = Array.from({ length: 25 }, (_, i) => ({ fileUrl: `https://drive.google.com/open?id=file${i}` }));
     expect(() => mergeAttachments(many, [{ fileUrl: 'https://drive.google.com/open?id=one-more' }], [])).toThrow(/25/);
@@ -199,5 +236,67 @@ describe('mergeAttachments', () => {
     expect(mergeAttachments(undefined, [{ fileUrl: 'https://drive.google.com/open?id=1a' }], [])).toEqual([
       { fileUrl: 'https://drive.google.com/open?id=1a' },
     ]);
+  });
+});
+
+describe('normalizeAttendees', () => {
+  it('turns bare emails into attendee entries', () => {
+    expect(normalizeAttendees(['a@x.com', 'b@x.com'])).toEqual([{ email: 'a@x.com' }, { email: 'b@x.com' }]);
+    expect(normalizeAttendees([])).toEqual([]);
+  });
+
+  it('keeps displayName and the flags that are set, dropping empty or false ones', () => {
+    expect(normalizeAttendees([
+      { email: 'a@x.com', displayName: 'Alice', optional: true },
+      { email: 'b@x.com', displayName: '', optional: false },
+      { email: 'room@x.com', resource: true },
+      { email: 'c@x.com', additionalGuests: 2, responseStatus: 'accepted' },
+      { email: 'd@x.com', additionalGuests: 0, resource: false },
+    ])).toEqual([
+      { email: 'a@x.com', displayName: 'Alice', optional: true },
+      { email: 'b@x.com' },
+      { email: 'room@x.com', resource: true },
+      { email: 'c@x.com', additionalGuests: 2, responseStatus: 'accepted' },
+      { email: 'd@x.com' },
+    ]);
+  });
+});
+
+describe('validateEventTypeTimes', () => {
+  const allDay = (start: string, end: string) => ({ start: { date: start }, end: { date: end } });
+
+  it('refuses all-day out-of-office and focus time', () => {
+    expect(() => validateEventTypeTimes('outOfOffice', allDay('2026-10-20', '2026-10-21'))).toThrow(/timed/);
+    expect(() => validateEventTypeTimes('focusTime', allDay('2026-10-20', '2026-10-21'))).toThrow(/timed/);
+  });
+
+  it('allows an all-day working location only when it covers one day', () => {
+    expect(() => validateEventTypeTimes('workingLocation', allDay('2026-10-20', '2026-10-22'))).toThrow(/one day/);
+    expect(() => validateEventTypeTimes('workingLocation', allDay('2026-10-20', '2026-10-21'))).not.toThrow();
+  });
+
+  it('leaves timed events and ordinary types alone', () => {
+    const timed = { start: { dateTime: '2026-10-20T10:00:00Z' }, end: { dateTime: '2026-10-20T11:00:00Z' } };
+    expect(() => validateEventTypeTimes('focusTime', timed)).not.toThrow();
+    expect(() => validateEventTypeTimes('default', allDay('2026-10-20', '2026-10-25'))).not.toThrow();
+    expect(() => validateEventTypeTimes(undefined, allDay('2026-10-20', '2026-10-25'))).not.toThrow();
+  });
+});
+
+describe('withEventTypeHint', () => {
+  it('adds the event type rules to a 400 for a special event type only', () => {
+    const bad = new ToolFailure({ error: 'Invalid request', status: 400 });
+    const hinted = withEventTypeHint(bad, 'outOfOffice') as ToolFailure;
+    expect(hinted.payload).toMatchObject({ error: 'Invalid request', eventType: 'outOfOffice' });
+    expect(hinted.payload.hint).toMatch(/primary calendar/);
+    expect(withEventTypeHint(bad, 'default')).toBe(bad);
+    const notFound = new ToolFailure({ error: 'gone', status: 404 });
+    expect(withEventTypeHint(notFound, 'focusTime')).toBe(notFound);
+  });
+});
+
+describe('describeAttendeeRoster', () => {
+  it('summarises the roster without listing everyone', () => {
+    expect(describeAttendeeRoster([{ email: 'a@x.com' }, { email: 'b@x.com' }], 1)).toBe('2 attendee(s), e.g. a@x.com and 1 more');
   });
 });

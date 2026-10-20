@@ -46,7 +46,7 @@ Eight tools across four categories:
 
 Every tool declares both `inputSchema` and `outputSchema` and returns
 `structuredContent`. Annotations (`readOnlyHint`, `destructiveHint`) are set
-where appropriate. See `src/tools.ts` for the full definitions.
+where appropriate. Each tool lives in `src/tools/<tool>.ts`; `src/tools.ts` assembles them.
 
 ## Local build and run
 
